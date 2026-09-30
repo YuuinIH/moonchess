@@ -20,7 +20,7 @@ Sources:
 
 ## Decision
 
-Use Go for gateway, worker, room actor, chess rules, and etcd control plane. The pinned Mooncake image's Store REST process is the currently runnable data-plane adapter. The official Go binding is the native integration target; this repository has not yet demonstrated its CGo packaging or direct placement calls.
+Use Go for gateway, worker, room actor, chess rules, and etcd control plane. The pinned Mooncake image's Store REST process is the currently runnable data-plane adapter. The official Go binding is the native integration target; this repository has not yet demonstrated its CGo packaging or direct placement calls. The pinned image contains `mooncake/store.so`, but no `libmooncake_store.so` or `store_c.h`; a symbol probe confirmed that the Python extension does not export the C-ABI create/setup/put/get functions. Native Go integration therefore requires a separate C-ABI library build and a matching runtime image, not merely linking against the shipped Python extension.
 
 Mooncake's own service sits behind `state.Store`. The adapter is UTF-8 JSON only. Its reads count payload bytes at the Go boundary, not physical transfer bytes. It cannot assert Mooncake locality aware placement or a physical cold/warm/hot path; those require a native Store client per worker and placement telemetry.
 
