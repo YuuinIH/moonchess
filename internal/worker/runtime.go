@@ -13,6 +13,7 @@ import (
 
 	"github.com/yuuinih/moonchess/internal/control"
 	"github.com/yuuinih/moonchess/internal/game"
+	"github.com/yuuinih/moonchess/internal/httpjson"
 	"github.com/yuuinih/moonchess/internal/state"
 )
 
@@ -132,7 +133,7 @@ func (r *Runtime) closeActors() {
 func (r *Runtime) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "worker": r.ID})
+		httpjson.Write(w, http.StatusOK, map[string]string{"status": "ok", "worker": r.ID})
 	})
 	mux.HandleFunc("POST /internal/games/{gameID}/moves", r.handleMove)
 	return mux
@@ -142,7 +143,7 @@ func (r *Runtime) handleMove(w http.ResponseWriter, request *http.Request) {
 	gameID := strings.TrimSpace(request.PathValue("gameID"))
 	actor := r.actor(gameID)
 	if actor == nil {
-		writeJSON(w, http.StatusConflict, map[string]string{"error": "game is not loaded on this worker"})
+		httpjson.Write(w, http.StatusConflict, map[string]string{"error": "game is not loaded on this worker"})
 		return
 	}
 	var body struct {
@@ -150,7 +151,7 @@ func (r *Runtime) handleMove(w http.ResponseWriter, request *http.Request) {
 	}
 	decoder := json.NewDecoder(http.MaxBytesReader(w, request.Body, 4096))
 	if err := decoder.Decode(&body); err != nil || body.Move == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "move must be a UCI string such as e2e4"})
+		httpjson.Write(w, http.StatusBadRequest, map[string]string{"error": "move must be a UCI string such as e2e4"})
 		return
 	}
 	snapshot, record, err := actor.Move(request.Context(), body.Move)
@@ -159,14 +160,8 @@ func (r *Runtime) handleMove(w http.ResponseWriter, request *http.Request) {
 		if errors.Is(err, control.ErrFenced) {
 			status = http.StatusConflict
 		}
-		writeJSON(w, status, map[string]string{"error": err.Error()})
+		httpjson.Write(w, status, map[string]string{"error": err.Error()})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"game": snapshot, "control": record})
-}
-
-func writeJSON(w http.ResponseWriter, status int, value any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(value)
+	httpjson.Write(w, http.StatusOK, map[string]any{"game": snapshot, "control": record})
 }

@@ -1,8 +1,16 @@
-.PHONY: test build up down logs smoke experiment-kill experiment-stale clean
+.PHONY: test integration verify build up down logs smoke experiment-kill experiment-stale clean
 
 test:
 	go test -race ./...
 	go vet ./...
+
+integration:
+	MOONCHESS_TEST_POSTGRES_URL='postgres://moonchess:moonchess@localhost:15432/moonchess?sslmode=disable' go test ./internal/control -run TestPostgresPlaneFencesExpiredOwner -count=1
+
+verify: test up integration
+	./scripts/smoke.sh
+	./scripts/experiment-kill.sh
+	./scripts/experiment-stale.sh
 
 build:
 	go build ./cmd/moonchess

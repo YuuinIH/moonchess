@@ -2,7 +2,6 @@ package gateway
 
 import (
 	"bytes"
-	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -15,6 +14,7 @@ import (
 
 	"github.com/yuuinih/moonchess/internal/control"
 	"github.com/yuuinih/moonchess/internal/game"
+	"github.com/yuuinih/moonchess/internal/httpjson"
 	"github.com/yuuinih/moonchess/internal/state"
 	webassets "github.com/yuuinih/moonchess/web"
 )
@@ -32,7 +32,7 @@ func (g *Gateway) Handler() http.Handler {
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+		httpjson.Write(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
 	mux.HandleFunc("POST /api/games", g.createGame)
 	mux.HandleFunc("GET /api/games/{gameID}", g.getGame)
@@ -59,7 +59,7 @@ func (g *Gateway) createGame(w http.ResponseWriter, request *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	writeJSON(w, http.StatusCreated, map[string]any{"game": snapshot, "control": record})
+	httpjson.Write(w, http.StatusCreated, map[string]any{"game": snapshot, "control": record})
 }
 
 func (g *Gateway) getGame(w http.ResponseWriter, request *http.Request) {
@@ -82,7 +82,7 @@ func (g *Gateway) getGame(w http.ResponseWriter, request *http.Request) {
 		writeError(w, http.StatusInternalServerError, fmt.Errorf("decode snapshot: %w", err))
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"game": snapshot, "control": record})
+	httpjson.Write(w, http.StatusOK, map[string]any{"game": snapshot, "control": record})
 }
 
 func (g *Gateway) move(w http.ResponseWriter, request *http.Request) {
@@ -149,31 +149,6 @@ func ParseWorkerEndpoints(value string) (map[string]string, error) {
 	return result, nil
 }
 
-func writeJSON(w http.ResponseWriter, status int, value any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(value)
-}
-
 func writeError(w http.ResponseWriter, status int, err error) {
-	writeJSON(w, status, map[string]string{"error": err.Error()})
-}
-
-func WaitForOwner(ctx context.Context, plane control.Plane, gameID string) (control.Record, error) {
-	ticker := time.NewTicker(50 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		record, err := plane.Get(ctx, gameID)
-		if err != nil {
-			return control.Record{}, err
-		}
-		if record.OwnerID != "" && record.LeaseUntil.After(time.Now()) {
-			return record, nil
-		}
-		select {
-		case <-ctx.Done():
-			return control.Record{}, ctx.Err()
-		case <-ticker.C:
-		}
-	}
+	httpjson.Write(w, status, map[string]string{"error": err.Error()})
 }

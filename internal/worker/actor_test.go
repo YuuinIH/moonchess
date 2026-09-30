@@ -3,6 +3,7 @@ package worker_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/yuuinih/moonchess/internal/control"
@@ -26,6 +27,9 @@ func (c *rejectingCommitter) Commit(context.Context, control.Lease, int64, strin
 	c.called = true
 	return control.Record{}, control.ErrFenced
 }
+func (c *rejectingCommitter) Get(context.Context, string) (control.Record, error) {
+	return control.Record{OwnerID: "worker-b", Epoch: 5}, nil
+}
 
 func TestActorLeavesOrphanAndDoesNotAdvanceWhenFenced(t *testing.T) {
 	store := &recordingStore{}
@@ -41,10 +45,60 @@ func TestActorLeavesOrphanAndDoesNotAdvanceWhenFenced(t *testing.T) {
 	if !committer.called {
 		t.Fatal("commit was not attempted after the snapshot put")
 	}
-	if len(store.keys) != 1 || store.keys[0] != "game/g1/epoch/4/seq/8" {
+	if len(store.keys) != 1 || !strings.HasPrefix(store.keys[0], "game/g1/epoch/4/seq/8/attempt/") {
 		t.Fatalf("put keys = %#v", store.keys)
 	}
 	if got := actor.State(); got.Turn != "white" || len(got.Moves) != 0 {
 		t.Fatalf("actor advanced after failed CAS: %#v", got)
+	}
+}
+
+type ambiguousCommitter struct {
+	record control.Record
+}
+
+func (c *ambiguousCommitter) Commit(_ context.Context, lease control.Lease, previousSeq int64, key string) (control.Record, error) {
+	c.record = control.Record{GameID: lease.GameID, OwnerID: lease.WorkerID, Epoch: lease.Epoch, SnapshotSeq: previousSeq + 1, SnapshotKey: key}
+	return control.Record{}, errors.New("connection lost after commit")
+}
+func (c *ambiguousCommitter) Get(context.Context, string) (control.Record, error) {
+	return c.record, nil
+}
+
+type snapshotStore struct {
+	values map[string][]byte
+}
+
+func (s *snapshotStore) Put(_ context.Context, key string, value []byte) error {
+	s.values[key] = append([]byte(nil), value...)
+	return nil
+}
+func (s *snapshotStore) Get(_ context.Context, key string) ([]byte, error) {
+	return s.values[key], nil
+}
+
+func TestActorReconcilesCommitWhoseResponseWasLost(t *testing.T) {
+	store := &snapshotStore{values: make(map[string][]byte)}
+	committer := &ambiguousCommitter{}
+	lease := control.Lease{GameID: "g1", WorkerID: "worker-a", Epoch: 2}
+	actor := worker.NewActor(lease, 0, game.NewState(), store, committer)
+	defer actor.Close()
+
+	snapshot, record, err := actor.Move(context.Background(), "e2e4")
+	if err != nil {
+		t.Fatalf("move: %v", err)
+	}
+	if snapshot.Turn != "black" || record.SnapshotSeq != 1 {
+		t.Fatalf("snapshot=%#v record=%#v", snapshot, record)
+	}
+}
+
+func TestClosedActorRejectsMove(t *testing.T) {
+	actor := worker.NewActor(control.Lease{GameID: "g1"}, 0, game.NewState(), &recordingStore{}, &rejectingCommitter{})
+	actor.Close()
+
+	_, _, err := actor.Move(context.Background(), "e2e4")
+	if !errors.Is(err, worker.ErrActorClosed) {
+		t.Fatalf("move error = %v, want ErrActorClosed", err)
 	}
 }

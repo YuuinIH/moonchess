@@ -10,7 +10,7 @@ The application is pure Go. Mooncake runs as the official pinned `kvcacheai/moon
 - One goroutine/channel actor per owned game; commands for a room are serialized.
 - Two workers competing for expiring PostgreSQL leases.
 - Epoch plus owner plus sequence compare-and-swap on every commit.
-- Immutable `game/<id>/epoch/<epoch>/seq/<seq>` Mooncake keys.
+- Immutable `game/<id>/epoch/<epoch>/seq/<seq>/attempt/<attempt>` Mooncake keys.
 - Gateway API and a minimal browser board with live owner/epoch/lease state.
 - Deterministic kill-takeover and paused-stale-worker experiments.
 - `control.Plane` and `state.Store` interfaces for future backends.
@@ -86,6 +86,12 @@ This removes the Compose containers and the PostgreSQL volume. Mooncake snapshot
 
 ```bash
 make test
+```
+
+To run the full acceptance path—including Compose startup, the real PostgreSQL contract, Mooncake smoke test, killed-owner takeover, and stale-worker fencing—use:
+
+```bash
+make verify
 ```
 
 The PostgreSQL contract test is opt-in because it needs a database:

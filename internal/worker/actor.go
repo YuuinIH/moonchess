@@ -2,7 +2,10 @@ package worker
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 
 	"github.com/yuuinih/moonchess/internal/control"
@@ -10,8 +13,11 @@ import (
 	"github.com/yuuinih/moonchess/internal/state"
 )
 
+var ErrActorClosed = errors.New("room actor is closed")
+
 type Committer interface {
 	Commit(context.Context, control.Lease, int64, string) (control.Record, error)
+	Get(context.Context, string) (control.Record, error)
 }
 
 type moveRequest struct {
@@ -60,13 +66,36 @@ func (a *Actor) run(seq int64, current game.State) {
 				request.reply <- moveResult{err: fmt.Errorf("encode snapshot: %w", err)}
 				continue
 			}
-			key := fmt.Sprintf("game/%s/epoch/%d/seq/%d", a.lease.GameID, a.lease.Epoch, seq+1)
+			attemptID, err := newAttemptID()
+			if err != nil {
+				request.reply <- moveResult{err: err}
+				continue
+			}
+			key := fmt.Sprintf("game/%s/epoch/%d/seq/%d/attempt/%s", a.lease.GameID, a.lease.Epoch, seq+1, attemptID)
 			if err := a.store.Put(request.ctx, key, payload); err != nil {
 				request.reply <- moveResult{err: fmt.Errorf("put snapshot: %w", err)}
 				continue
 			}
 			record, err := a.committer.Commit(request.ctx, a.lease, seq, key)
 			if err != nil {
+				reconciled, reconcileErr := a.committer.Get(request.ctx, a.lease.GameID)
+				if reconcileErr == nil && reconciled.OwnerID == a.lease.WorkerID && reconciled.Epoch == a.lease.Epoch && reconciled.SnapshotSeq > seq {
+					payload, getErr := a.store.Get(request.ctx, reconciled.SnapshotKey)
+					var restored game.State
+					if getErr == nil {
+						getErr = json.Unmarshal(payload, &restored)
+					}
+					if getErr == nil {
+						seq = reconciled.SnapshotSeq
+						current = restored
+						if reconciled.SnapshotKey == key {
+							request.reply <- moveResult{state: current, record: reconciled}
+							continue
+						}
+						request.reply <- moveResult{err: fmt.Errorf("actor reconciled to committed seq %d; retry move: %w", seq, err)}
+						continue
+					}
+				}
 				request.reply <- moveResult{err: fmt.Errorf("commit move: %w", err)}
 				continue
 			}
@@ -81,16 +110,28 @@ func (a *Actor) run(seq int64, current game.State) {
 	}
 }
 
+func newAttemptID() (string, error) {
+	var value [12]byte
+	if _, err := rand.Read(value[:]); err != nil {
+		return "", fmt.Errorf("generate snapshot attempt id: %w", err)
+	}
+	return hex.EncodeToString(value[:]), nil
+}
+
 func (a *Actor) Move(ctx context.Context, uci string) (game.State, control.Record, error) {
 	reply := make(chan moveResult, 1)
 	select {
 	case a.moves <- moveRequest{ctx: ctx, move: uci, reply: reply}:
+	case <-a.stop:
+		return game.State{}, control.Record{}, ErrActorClosed
 	case <-ctx.Done():
 		return game.State{}, control.Record{}, ctx.Err()
 	}
 	select {
 	case result := <-reply:
 		return result.state, result.record, result.err
+	case <-a.stop:
+		return game.State{}, control.Record{}, ErrActorClosed
 	case <-ctx.Done():
 		return game.State{}, control.Record{}, ctx.Err()
 	}
