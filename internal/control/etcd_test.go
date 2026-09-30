@@ -80,4 +80,14 @@ func TestEtcdFencesExpiredOwner(t *testing.T) {
 	if _, err := p.Commit(ctx, b, migrating, "delta-2"); !errors.Is(err, control.ErrFenced) {
 		t.Fatalf("commit after migration began: %v", err)
 	}
+	active, err := p.CancelMigration(ctx, b, migrating)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if active.Phase != "active" || active.TargetID != "" {
+		t.Fatalf("migration rollback: %#v", active)
+	}
+	if _, err := p.Commit(ctx, b, active, "delta-2"); err != nil {
+		t.Fatalf("commit after migration rollback: %v", err)
+	}
 }

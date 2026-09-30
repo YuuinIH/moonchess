@@ -73,7 +73,18 @@ func (g *Gateway) getGame(w http.ResponseWriter, request *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	materialized, _, err := state.MaterializeWithFallback(request.Context(), g.Store, record.CommittedSeq, record.HeadRef, record.CheckpointRef, record.CheckpointSeq, record.FallbackRef, record.FallbackSeq, nil)
+	var materialized state.Materialized
+	for attempt := 0; attempt < 2; attempt++ {
+		materialized, _, err = state.MaterializeWithFallback(request.Context(), g.Store, record.CommittedSeq, record.HeadRef, record.CheckpointRef, record.CheckpointSeq, record.FallbackRef, record.FallbackSeq, nil)
+		if err == nil {
+			break
+		}
+		fresh, readErr := g.Plane.Get(request.Context(), record.GameID)
+		if readErr != nil || fresh.Revision == record.Revision {
+			break
+		}
+		record = fresh
+	}
 	if err != nil {
 		writeError(w, http.StatusServiceUnavailable, err)
 		return

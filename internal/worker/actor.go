@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -140,15 +141,40 @@ func (a *Actor) writeCheckpoint(ctx context.Context) {
 		return
 	}
 	if record, err := a.plane.Checkpoint(ctx, a.lease, a.record, ref); err == nil {
-		// The old latest checkpoint is now fallback. Its covered deltas are no
-		// longer required by either retained checkpoint; the prior fallback is
-		// also unreachable. Failed removals only leak space.
-		for _, old := range previous.CoveredRefs {
-			_ = a.store.Remove(ctx, old)
-		}
+		// Keep a grace period for readers of the old metadata and Mooncake's
+		// object leases. The old latest is now fallback, so only its covered
+		// deltas and the older checkpoint are eligible for deletion.
+		obsolete := append([]string(nil), previous.CoveredRefs...)
 		if previous.PreviousCheckpointRef != "" {
-			_ = a.store.Remove(ctx, previous.PreviousCheckpointRef)
+			obsolete = append(obsolete, previous.PreviousCheckpointRef)
 		}
 		a.record = record
+		if len(obsolete) > 0 {
+			go a.collectObsolete(obsolete)
+		}
+	}
+}
+
+func (a *Actor) collectObsolete(refs []string) {
+	// A failed or interrupted GC may leak unreachable objects, never canonical
+	// state. Retry transient Store lease failures without extending move ACK time.
+	time.Sleep(12 * time.Second)
+	for attempt := 0; attempt < 24 && len(refs) > 0; attempt++ {
+		remaining := refs[:0]
+		for _, ref := range refs {
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			err := a.store.Remove(ctx, ref)
+			cancel()
+			if err != nil && !errors.Is(err, state.ErrNotFound) {
+				remaining = append(remaining, ref)
+			}
+		}
+		refs = remaining
+		if len(refs) > 0 {
+			time.Sleep(5 * time.Second)
+		}
+	}
+	if len(refs) > 0 {
+		slog.Warn("checkpoint GC incomplete", "game", a.lease.GameID, "remaining", len(refs))
 	}
 }

@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/yuuinih/moonchess/internal/control"
 	"github.com/yuuinih/moonchess/internal/game"
@@ -13,20 +15,32 @@ import (
 	"github.com/yuuinih/moonchess/internal/worker"
 )
 
-type memoryStore struct{ data map[string][]byte }
+type memoryStore struct {
+	mu   sync.Mutex
+	data map[string][]byte
+}
 
 func (s *memoryStore) Put(_ context.Context, k string, v []byte) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.data[k] = append([]byte(nil), v...)
 	return nil
 }
 func (s *memoryStore) Get(_ context.Context, k string) ([]byte, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	v, ok := s.data[k]
 	if !ok {
 		return nil, state.ErrNotFound
 	}
 	return append([]byte(nil), v...), nil
 }
-func (s *memoryStore) Remove(_ context.Context, k string) error { delete(s.data, k); return nil }
+func (s *memoryStore) Remove(_ context.Context, k string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.data, k)
+	return nil
+}
 
 type rejectedPlane struct {
 	control.Plane
@@ -49,8 +63,11 @@ func TestFencedMoveLeavesOnlyAnUncommittedDelta(t *testing.T) {
 	if !errors.Is(err, control.ErrFenced) {
 		t.Fatalf("move error = %v", err)
 	}
-	if p.commits != 1 || len(s.data) != 1 {
-		t.Fatalf("commits=%d objects=%d", p.commits, len(s.data))
+	s.mu.Lock()
+	objectCount := len(s.data)
+	s.mu.Unlock()
+	if p.commits != 1 || objectCount != 1 {
+		t.Fatalf("commits=%d objects=%d", p.commits, objectCount)
 	}
 	if got := a.State(); got.Turn != "white" || len(got.Moves) != 0 {
 		t.Fatalf("actor advanced: %#v", got)
@@ -104,17 +121,28 @@ func TestCheckpointKeepsLatestFallbackAndCollectsCoveredDeltas(t *testing.T) {
 	if p.record.CheckpointSeq != 16 || p.record.FallbackSeq != 8 {
 		t.Fatalf("checkpoints: %#v", p.record)
 	}
-	if _, ok := s.data[initial]; ok {
-		t.Fatal("obsolete initial checkpoint retained")
-	}
 	var cpCount, deltaCount int
-	for ref := range s.data {
-		if strings.HasPrefix(ref, "checkpoint/") {
-			cpCount++
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		cpCount, deltaCount = 0, 0
+		s.mu.Lock()
+		_, initialRetained := s.data[initial]
+		for ref := range s.data {
+			if strings.HasPrefix(ref, "checkpoint/") {
+				cpCount++
+			}
+			if strings.HasPrefix(ref, "delta/") {
+				deltaCount++
+			}
 		}
-		if strings.HasPrefix(ref, "delta/") {
-			deltaCount++
+		s.mu.Unlock()
+		if !initialRetained && cpCount == 2 && deltaCount == 8 {
+			break
 		}
+		if time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
 	if cpCount != 2 || deltaCount != 8 {
 		t.Fatalf("objects: checkpoints=%d deltas=%d", cpCount, deltaCount)
@@ -123,7 +151,7 @@ func TestCheckpointKeepsLatestFallbackAndCollectsCoveredDeltas(t *testing.T) {
 	if err != nil || len(materialized.State.Moves) != 16 {
 		t.Fatalf("latest checkpoint recovery: moves=%d error=%v", len(materialized.State.Moves), err)
 	}
-	delete(s.data, p.record.CheckpointRef)
+	_ = s.Remove(ctx, p.record.CheckpointRef)
 	materialized, _, err = state.MaterializeWithFallback(ctx, s, p.record.CommittedSeq, p.record.HeadRef, p.record.CheckpointRef, p.record.CheckpointSeq, p.record.FallbackRef, p.record.FallbackSeq, nil)
 	if err != nil || len(materialized.State.Moves) != 16 {
 		t.Fatalf("fallback recovery: moves=%d error=%v", len(materialized.State.Moves), err)

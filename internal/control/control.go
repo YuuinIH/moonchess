@@ -50,5 +50,6 @@ type Plane interface {
 	SetProgress(context.Context, string, string, Progress) error
 	GetProgress(context.Context, string, string) (Progress, error)
 	BeginMigration(context.Context, Lease, Record, string) (Record, error)
+	CancelMigration(context.Context, Lease, Record) (Record, error)
 	Release(context.Context, Lease) error
 }

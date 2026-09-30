@@ -194,6 +194,16 @@ func (e *Etcd) BeginMigration(ctx context.Context, l Lease, observed Record, tar
 	next.Phase = "migrating"
 	return e.update(ctx, l, observed, next)
 }
+func (e *Etcd) CancelMigration(ctx context.Context, l Lease, observed Record) (Record, error) {
+	if observed.Phase != "migrating" || observed.OwnerID != l.WorkerID || observed.Epoch != l.Epoch {
+		return Record{}, ErrFenced
+	}
+	next := observed
+	next.Phase = "active"
+	next.TargetID = ""
+	next.TargetUntilUnixMS = 0
+	return e.update(ctx, l, observed, next)
+}
 func (e *Etcd) Release(ctx context.Context, l Lease) error {
 	resp, err := e.client.Txn(ctx).If(clientv3.Compare(clientv3.Value(ownerKey(l.GameID)), "=", ownerValue(l)), clientv3.Compare(clientv3.LeaseValue(ownerKey(l.GameID)), "=", l.ID)).Then(clientv3.OpDelete(ownerKey(l.GameID))).Commit()
 	if err != nil {

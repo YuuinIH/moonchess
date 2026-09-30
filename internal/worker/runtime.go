@@ -139,7 +139,20 @@ func (r *Runtime) materialize(ctx context.Context, record control.Record) (state
 	if ok {
 		local = &cached
 	}
-	m, metrics, err := state.MaterializeWithFallback(ctx, r.Store, record.CommittedSeq, record.HeadRef, record.CheckpointRef, record.CheckpointSeq, record.FallbackRef, record.FallbackSeq, local)
+	var m state.Materialized
+	var metrics state.Metrics
+	var err error
+	for attempt := 0; attempt < 2; attempt++ {
+		m, metrics, err = state.MaterializeWithFallback(ctx, r.Store, record.CommittedSeq, record.HeadRef, record.CheckpointRef, record.CheckpointSeq, record.FallbackRef, record.FallbackSeq, local)
+		if err == nil {
+			break
+		}
+		fresh, readErr := r.Plane.Get(ctx, record.GameID)
+		if readErr != nil || fresh.Revision == record.Revision {
+			break
+		}
+		record = fresh
+	}
 	if err != nil {
 		return metrics, err
 	}
@@ -164,8 +177,12 @@ func (r *Runtime) materialize(ctx context.Context, record control.Record) (state
 func (r *Runtime) actor(id string) *Actor { r.mu.RLock(); defer r.mu.RUnlock(); return r.actors[id] }
 func (r *Runtime) closeActors() {
 	r.mu.Lock()
-	defer r.mu.Unlock()
+	actors := make([]*Actor, 0, len(r.actors))
 	for _, a := range r.actors {
+		actors = append(actors, a)
+	}
+	r.mu.Unlock()
+	for _, a := range actors {
 		a.Close()
 	}
 }
@@ -242,6 +259,12 @@ func (r *Runtime) handleMigrate(w http.ResponseWriter, req *http.Request) {
 	// The target already materialized this head. A later move would have failed
 	// the metadata CAS above, so the lease can now be transferred.
 	if err := r.Plane.Release(req.Context(), a.Lease()); err != nil {
+		rollbackCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		_, rollbackErr := r.Plane.CancelMigration(rollbackCtx, a.Lease(), migrating)
+		cancel()
+		if rollbackErr != nil {
+			a.Close()
+		}
 		httpjson.Write(w, 503, map[string]string{"error": err.Error()})
 		return
 	}

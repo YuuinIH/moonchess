@@ -31,4 +31,10 @@ wait_progress 2
 sleep 1
 progress=$(curl -fsS "$progress_url")
 echo "$progress" | jq -e '(.history | any(.path == "cold")) and (.history | any(.path == "warm")) and (.hotCount > 0) and (.metrics.bytesMoved > 0) and (.metrics.replayCount > 0)' >/dev/null
-echo "PASS locality: game=$game_id replica=$replica cold/warm/hot observed with transfer/replay metrics"
+old_epoch=$(echo "$before" | jq -r '.control.epoch')
+curl -fsS -X POST "$gateway_url/api/games/$game_id/migrate" -H 'Content-Type: application/json' -d "{\"target\":\"$replica\"}" >/dev/null
+after=$(wait_for_owner "$game_id" "$owner")
+[ "$(echo "$after" | jq -r '.control.ownerId')" = "$replica" ]
+[ "$(echo "$after" | jq -r '.control.epoch')" -gt "$old_epoch" ]
+move "$game_id" g1f3 >/dev/null
+echo "PASS locality: game=$game_id replica=$replica cold/warm/hot observed; warm owner transfer committed next move"
