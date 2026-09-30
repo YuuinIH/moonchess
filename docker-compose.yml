@@ -1,0 +1,100 @@
+name: moonchess
+
+x-worker-environment: &worker-environment
+  DATABASE_URL: postgres://moonchess:moonchess@postgres:5432/moonchess?sslmode=disable
+  MOONCAKE_URL: http://mooncake-store:8080
+  LEASE_TTL: 3s
+  POLL_INTERVAL: 400ms
+  HTTP_ADDR: :8081
+
+services:
+  postgres:
+    image: postgres:16.4-alpine
+    environment:
+      POSTGRES_USER: moonchess
+      POSTGRES_PASSWORD: moonchess
+      POSTGRES_DB: moonchess
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U moonchess -d moonchess"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    ports:
+      - "15432:5432"
+
+  mooncake-master:
+    image: kvcacheai/mooncake:0.3.13.post1
+    command:
+      - mooncake_master
+      - --rpc_address=0.0.0.0
+      - --rpc_port=50051
+      - --enable_http_metadata_server=true
+      - --http_metadata_server_host=0.0.0.0
+      - --http_metadata_server_port=8080
+
+  mooncake-store:
+    image: kvcacheai/mooncake:0.3.13.post1
+    command: ["mc_store_rest_server", "--port", "8080", "--max-wait-time", "120"]
+    environment:
+      MOONCAKE_LOCAL_HOSTNAME: mooncake-store
+      MOONCAKE_TE_META_DATA_SERVER: http://mooncake-master:8080/metadata
+      MOONCAKE_GLOBAL_SEGMENT_SIZE: "67108864"
+      MOONCAKE_LOCAL_BUFFER_SIZE: "67108864"
+      MOONCAKE_PROTOCOL: tcp
+      MOONCAKE_DEVICE: ""
+      MOONCAKE_MASTER: mooncake-master:50051
+    depends_on:
+      - mooncake-master
+
+  worker-a:
+    build: .
+    command: ["worker"]
+    environment:
+      <<: *worker-environment
+      WORKER_ID: worker-a
+    ports:
+      - "18081:8081"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mooncake-store:
+        condition: service_started
+
+  worker-b:
+    build: .
+    command: ["worker"]
+    environment:
+      <<: *worker-environment
+      WORKER_ID: worker-b
+    ports:
+      - "18082:8081"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mooncake-store:
+        condition: service_started
+
+  gateway:
+    build: .
+    command: ["gateway"]
+    environment:
+      DATABASE_URL: postgres://moonchess:moonchess@postgres:5432/moonchess?sslmode=disable
+      MOONCAKE_URL: http://mooncake-store:8080
+      WORKER_ENDPOINTS: worker-a=http://worker-a:8081,worker-b=http://worker-b:8081
+      HTTP_ADDR: :8080
+    ports:
+      - "18080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mooncake-store:
+        condition: service_started
+      worker-a:
+        condition: service_started
+      worker-b:
+        condition: service_started
+
+volumes:
+  postgres-data:

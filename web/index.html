@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>MoonChess V0</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <main>
+    <section>
+      <p class="eyebrow">MOONCHESS V0</p>
+      <h1>State outlives the worker.</h1>
+      <div id="board" class="board" aria-label="Chess board"></div>
+      <p id="message">Creating a room…</p>
+    </section>
+    <aside>
+      <h2>Control plane</h2>
+      <dl>
+        <dt>Game</dt><dd id="game-id">—</dd>
+        <dt>Owner</dt><dd id="owner">—</dd>
+        <dt>Epoch</dt><dd id="epoch">—</dd>
+        <dt>Snapshot</dt><dd id="sequence">—</dd>
+        <dt>Lease until</dt><dd id="lease">—</dd>
+      </dl>
+      <p class="hint">Click a piece, then its destination. Moves use the full chess rules engine.</p>
+    </aside>
+  </main>
+  <script src="/app.js"></script>
+</body>
+</html>
