@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -36,6 +37,7 @@ func (g *Gateway) Handler() http.Handler {
 	mux.HandleFunc("POST /api/games", g.createGame)
 	mux.HandleFunc("GET /api/games/{gameID}", g.getGame)
 	mux.HandleFunc("POST /api/games/{gameID}/moves", g.move)
+	mux.HandleFunc("POST /api/games/{gameID}/migrate", g.migrate)
 	mux.Handle("/", http.FileServer(http.FS(webassets.Assets)))
 	return mux
 }
@@ -47,8 +49,8 @@ func (g *Gateway) createGame(w http.ResponseWriter, request *http.Request) {
 		return
 	}
 	snapshot := game.NewState()
-	payload, _ := json.Marshal(snapshot)
-	key := fmt.Sprintf("game/%s/epoch/0/seq/0", gameID)
+	payload, _ := json.Marshal(state.Checkpoint{Seq: 0, State: snapshot})
+	key := state.Ref("checkpoint", gameID, 0, payload)
 	if err := g.Store.Put(request.Context(), key, payload); err != nil {
 		writeError(w, http.StatusServiceUnavailable, err)
 		return
@@ -71,17 +73,12 @@ func (g *Gateway) getGame(w http.ResponseWriter, request *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	payload, err := g.Store.Get(request.Context(), record.SnapshotKey)
+	materialized, _, err := state.MaterializeWithFallback(request.Context(), g.Store, record.CommittedSeq, record.HeadRef, record.CheckpointRef, record.CheckpointSeq, record.FallbackRef, record.FallbackSeq, nil)
 	if err != nil {
 		writeError(w, http.StatusServiceUnavailable, err)
 		return
 	}
-	var snapshot game.State
-	if err := json.Unmarshal(payload, &snapshot); err != nil {
-		writeError(w, http.StatusInternalServerError, fmt.Errorf("decode snapshot: %w", err))
-		return
-	}
-	httpjson.Write(w, http.StatusOK, map[string]any{"game": snapshot, "control": record})
+	httpjson.Write(w, http.StatusOK, map[string]any{"game": materialized.State, "control": record})
 }
 
 func (g *Gateway) move(w http.ResponseWriter, request *http.Request) {
@@ -102,7 +99,7 @@ func (g *Gateway) move(w http.ResponseWriter, request *http.Request) {
 		return
 	}
 	endpoint := g.WorkerEndpoints[record.OwnerID]
-	if endpoint == "" || record.LeaseUntil.Before(time.Now()) {
+	if endpoint == "" {
 		writeError(w, http.StatusServiceUnavailable, errors.New("room is between owners; retry shortly"))
 		return
 	}
@@ -123,6 +120,118 @@ func (g *Gateway) move(w http.ResponseWriter, request *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(resp.StatusCode)
 	_, _ = io.Copy(w, io.LimitReader(resp.Body, 1<<20))
+}
+
+func (g *Gateway) migrate(w http.ResponseWriter, request *http.Request) {
+	id := request.PathValue("gameID")
+	record, err := g.Plane.Get(request.Context(), id)
+	if err != nil {
+		writeError(w, 404, err)
+		return
+	}
+	var body struct {
+		Target        string `json:"target"`
+		ExpectedHead  string `json:"expectedHead"`
+		ExpectedSeq   int64  `json:"expectedSeq"`
+		ExpectedEpoch int64  `json:"expectedEpoch"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, request.Body, 4096)).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+		writeError(w, 400, errors.New("invalid migration body"))
+		return
+	}
+	if body.Target == "" {
+		body.Target, err = g.selectTarget(request.Context(), record)
+		if err != nil {
+			writeError(w, 503, err)
+			return
+		}
+	}
+	if body.Target == record.OwnerID || g.WorkerEndpoints[body.Target] == "" {
+		writeError(w, 400, errors.New("invalid target"))
+		return
+	}
+	endpoint := g.WorkerEndpoints[record.OwnerID]
+	if endpoint == "" {
+		writeError(w, 503, errors.New("game has no owner"))
+		return
+	}
+	prepare, err := http.NewRequestWithContext(request.Context(), http.MethodPost, strings.TrimRight(g.WorkerEndpoints[body.Target], "/")+"/internal/games/"+id+"/prepare", nil)
+	if err != nil {
+		writeError(w, 500, err)
+		return
+	}
+	prepared, err := g.Client.Do(prepare)
+	if err != nil {
+		writeError(w, 502, fmt.Errorf("prepare target: %w", err))
+		return
+	}
+	var ready struct {
+		Seq     int64  `json:"seq"`
+		HeadRef string `json:"headRef"`
+	}
+	decodeErr := json.NewDecoder(io.LimitReader(prepared.Body, 1<<20)).Decode(&ready)
+	_ = prepared.Body.Close()
+	if prepared.StatusCode != 200 || decodeErr != nil || ready.Seq != record.CommittedSeq || ready.HeadRef != record.HeadRef {
+		writeError(w, 409, errors.New("target did not materialize the observed canonical head; retry migration"))
+		return
+	}
+	body.ExpectedHead = record.HeadRef
+	body.ExpectedSeq = record.CommittedSeq
+	body.ExpectedEpoch = record.Epoch
+	payload, _ := json.Marshal(body)
+	req, err := http.NewRequestWithContext(request.Context(), http.MethodPost, strings.TrimRight(endpoint, "/")+"/internal/games/"+id+"/migrate", bytes.NewReader(payload))
+	if err != nil {
+		writeError(w, 500, err)
+		return
+	}
+	resp, err := g.Client.Do(req)
+	if err != nil {
+		writeError(w, 502, err)
+		return
+	}
+	defer resp.Body.Close()
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(resp.StatusCode)
+	_, _ = io.Copy(w, io.LimitReader(resp.Body, 1<<20))
+}
+
+func (g *Gateway) selectTarget(ctx context.Context, record control.Record) (string, error) {
+	chosen := ""
+	bestSeq := int64(-1)
+	bestExact := false
+	for worker, endpoint := range g.WorkerEndpoints {
+		if worker == record.OwnerID {
+			continue
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(endpoint, "/")+"/healthz", nil)
+		if err != nil {
+			continue
+		}
+		resp, err := g.Client.Do(req)
+		if err != nil {
+			continue
+		}
+		_ = resp.Body.Close()
+		if resp.StatusCode != 200 {
+			continue
+		}
+		progress, err := g.Plane.GetProgress(ctx, record.GameID, worker)
+		seq := int64(-1)
+		exact := false
+		if err == nil {
+			seq = progress.Seq
+			exact = progress.Seq == record.CommittedSeq && progress.HeadRef == record.HeadRef
+		}
+		if chosen == "" || exact && !bestExact || exact == bestExact && (seq > bestSeq || seq == bestSeq && worker < chosen) {
+			chosen = worker
+			bestSeq = seq
+			bestExact = exact
+		}
+	}
+	if chosen == "" {
+		return "", errors.New("no live migration target")
+	}
+	return chosen, nil
 }
 
 func randomID() (string, error) {

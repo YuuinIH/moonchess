@@ -1,15 +1,10 @@
-# MoonChess V0 acceptance specification
+# MoonChess final architecture
 
-This file records the implementation target supplied for this repository.
-
-- Research Mooncake's current non-Python interfaces and bindings, especially C++, C ABI, Rust, and Go.
-- Select Go, Rust, or C++ for the control plane, worker, and gateway using these priorities: minimal glue, stable Mooncake access, room-actor-friendly concurrency, and simple containers.
-- Store immutable game snapshots in Mooncake.
-- Store ownership, epoch, lease, and current snapshot pointer in PostgreSQL.
-- Run two workers and support takeover after owner failure.
-- Provide a gateway/API and minimal web chessboard.
-- Start with one Docker Compose command.
-- Demonstrate both killed-worker takeover and stale-worker fencing after pause/unpause.
-- Do not add Kubernetes, Redis, RDMA, GPU, or a Python application service.
-- Preserve `ControlPlane` and `StateStore` abstractions for future backends.
-- Include reproducible documentation, scripts, tests, and actual verification.
+- etcd is the only coordination authority: owner lease, epoch, fencing, committed head/sequence, checkpoints, migration phase and target, and advisory worker progress.
+- Mooncake contains immutable checkpoint and delta payloads. It provides storage placement, replication and transfer, without deciding canonical history.
+- MaterializedState = Checkpoint + DeltaSuffix. A warm worker follows missing prev links to its materialized head; a cold worker follows them to the latest checkpoint.
+- A move first writes a uniquely addressed immutable delta, then advances the canonical head by a fenced etcd transaction. Only transaction success is acknowledged.
+- Graceful migration and crash failover both materialize the target before acquiring ownership; explicit migration pins the target.
+- Checkpoints are periodic. The latest and fallback remain usable while covered older deltas are collected safely.
+- Kill owner, SIGSTOP/SIGCONT stale owner, and explicit migration are E2E acceptance scenarios.
+- No PostgreSQL or Kubernetes dependency. Go remains the runtime language; Mooncake native Go/C ABI integration should be preferred when its packaged library is available.

@@ -2,13 +2,13 @@
 
 MoonChess pins Mooncake to stable release `v0.3.13.post1` (`719735896c86b56fabec6cf3e825fb2ea640597a`). The survey below is tied to that release rather than a moving `main` branch.
 
-| Option | Current state | Integration cost | V0 assessment |
+| Option | Current state | Integration cost | Assessment |
 | --- | --- | --- | --- |
 | C++ `Client` | Primary, full Store API | Application inherits Mooncake's CMake and C++ dependency graph | Stable but couples every service to the heaviest toolchain |
 | C ABI (`store_c.h`) | Official create/setup/put/get/remove API | Still links the C++ Store libraries | Best foundation for other native bindings, not the simplest service boundary |
-| Go | Official package under `mooncake-store/go`; CGo over the C ABI | Idiomatic call site, but build/runtime must carry headers and native libraries | Excellent concurrency fit; native packaging is disproportionate for V0 |
+| Go | Official package under `mooncake-store/go`; CGo over the C ABI | Build/runtime must carry headers and native libraries | Preferred native path for this Go runtime; still needs packaged native libraries and an E2E check |
 | Rust | Official crate with static-link and `dlopen` backends | Good safety and Tokio actor fit; still needs the shared library at runtime | Viable, but more deployment glue than Go plus HTTP |
-| Store REST | Official `mc_store_rest_server` exposes put/get/exist/remove and owns a Store client | Plain HTTP from any language; the infrastructure image contains the Python wrapper | Chosen for V0: pure-Go business services, one pinned Mooncake container boundary |
+| Store REST | Official `mc_store_rest_server` exposes put/get/exist/remove and owns a Store client | Plain HTTP from Go; the infrastructure image contains a Python wrapper | Current Compose adapter; does not expose locality or placement controls to Go |
 
 Sources:
 
@@ -20,10 +20,10 @@ Sources:
 
 ## Decision
 
-Use Go for gateway, worker, room actor, chess rules, and PostgreSQL control plane. Use the pinned Mooncake image's Store REST process as the data-plane adapter.
+Use Go for gateway, worker, room actor, chess rules, and etcd control plane. The pinned Mooncake image's Store REST process is the currently runnable data-plane adapter. The official Go binding is the native integration target; this repository has not yet demonstrated its CGo packaging or direct placement calls.
 
-This is not an HTTP reimplementation of Mooncake. It is Mooncake's own service and binding, isolated behind MoonChess's `state.Store` interface. A later native adapter can replace `MooncakeHTTPStore` without changing actors or the control plane. This keeps V0 free of application-side Python and CGo while avoiding a bespoke sidecar.
+Mooncake's own service sits behind `state.Store`. The adapter is UTF-8 JSON only. Its reads count payload bytes at the Go boundary, not physical transfer bytes. It cannot assert Mooncake locality aware placement or a physical cold/warm/hot path; those require a native Store client per worker and placement telemetry.
 
 ## Known boundary
 
-Mooncake Store is a distributed cache. In this Compose topology, snapshots survive worker death or pause because the standalone Store process owns the memory. They do not survive loss of the Store process or host. Durable restart recovery is intentionally outside V0 and would require Mooncake persistence/offload or another `StateStore` implementation.
+Mooncake Store is a distributed cache. In this Compose topology, payloads survive worker death or pause because the standalone Store process owns the memory. They do not survive loss of that process or host.

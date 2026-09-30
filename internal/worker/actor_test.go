@@ -2,118 +2,130 @@ package worker_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
 
 	"github.com/yuuinih/moonchess/internal/control"
 	"github.com/yuuinih/moonchess/internal/game"
+	"github.com/yuuinih/moonchess/internal/state"
 	"github.com/yuuinih/moonchess/internal/worker"
 )
 
-type recordingStore struct {
-	keys []string
-}
+type memoryStore struct{ data map[string][]byte }
 
-func (s *recordingStore) Put(_ context.Context, key string, _ []byte) error {
-	s.keys = append(s.keys, key)
+func (s *memoryStore) Put(_ context.Context, k string, v []byte) error {
+	s.data[k] = append([]byte(nil), v...)
 	return nil
 }
-func (s *recordingStore) Get(context.Context, string) ([]byte, error) { return nil, nil }
+func (s *memoryStore) Get(_ context.Context, k string) ([]byte, error) {
+	v, ok := s.data[k]
+	if !ok {
+		return nil, state.ErrNotFound
+	}
+	return append([]byte(nil), v...), nil
+}
+func (s *memoryStore) Remove(_ context.Context, k string) error { delete(s.data, k); return nil }
 
-type rejectingCommitter struct {
-	called   bool
-	getCalls int
+type rejectedPlane struct {
+	control.Plane
+	record  control.Record
+	commits int
 }
 
-func (c *rejectingCommitter) Commit(context.Context, control.Lease, int64, string) (control.Record, error) {
-	c.called = true
+func (p *rejectedPlane) Get(context.Context, string) (control.Record, error) { return p.record, nil }
+func (p *rejectedPlane) Commit(_ context.Context, _ control.Lease, _ control.Record, _ string) (control.Record, error) {
+	p.commits++
 	return control.Record{}, control.ErrFenced
 }
-func (c *rejectingCommitter) Get(context.Context, string) (control.Record, error) {
-	c.getCalls++
-	if c.getCalls == 1 {
-		return control.Record{OwnerID: "worker-a", Epoch: 4, SnapshotSeq: 7}, nil
-	}
-	return control.Record{OwnerID: "worker-b", Epoch: 5}, nil
-}
 
-func TestActorLeavesOrphanAndDoesNotAdvanceWhenFenced(t *testing.T) {
-	store := &recordingStore{}
-	committer := &rejectingCommitter{}
-	lease := control.Lease{GameID: "g1", WorkerID: "worker-a", Epoch: 4}
-	actor := worker.NewActor(lease, 7, game.NewState(), store, committer)
-	defer actor.Close()
-
-	_, _, err := actor.Move(context.Background(), "e2e4")
+func TestFencedMoveLeavesOnlyAnUncommittedDelta(t *testing.T) {
+	s := &memoryStore{data: map[string][]byte{}}
+	r := control.Record{GameID: "g1", OwnerID: "a", Epoch: 2, HeadRef: "cp", CheckpointRef: "cp"}
+	p := &rejectedPlane{record: r}
+	a := worker.NewActor(control.Lease{GameID: "g1", WorkerID: "a", Epoch: 2}, r, state.Materialized{Head: "cp", State: game.NewState()}, s, p)
+	_, _, err := a.Move(context.Background(), "e2e4")
 	if !errors.Is(err, control.ErrFenced) {
-		t.Fatalf("move error = %v, want ErrFenced", err)
+		t.Fatalf("move error = %v", err)
 	}
-	if !committer.called {
-		t.Fatal("commit was not attempted after the snapshot put")
+	if p.commits != 1 || len(s.data) != 1 {
+		t.Fatalf("commits=%d objects=%d", p.commits, len(s.data))
 	}
-	if len(store.keys) != 1 || !strings.HasPrefix(store.keys[0], "game/g1/epoch/4/seq/8/attempt/") {
-		t.Fatalf("put keys = %#v", store.keys)
-	}
-	if got := actor.State(); got.Turn != "white" || len(got.Moves) != 0 {
-		t.Fatalf("actor advanced after failed CAS: %#v", got)
+	if got := a.State(); got.Turn != "white" || len(got.Moves) != 0 {
+		t.Fatalf("actor advanced: %#v", got)
 	}
 }
 
-type ambiguousCommitter struct {
-	record       control.Record
-	cancelCommit context.CancelFunc
+type acceptingPlane struct {
+	control.Plane
+	record control.Record
 }
 
-func (c *ambiguousCommitter) Commit(_ context.Context, lease control.Lease, previousSeq int64, key string) (control.Record, error) {
-	c.record = control.Record{GameID: lease.GameID, OwnerID: lease.WorkerID, Epoch: lease.Epoch, SnapshotSeq: previousSeq + 1, SnapshotKey: key}
-	if c.cancelCommit != nil {
-		c.cancelCommit()
+func (p *acceptingPlane) Get(context.Context, string) (control.Record, error) { return p.record, nil }
+func (p *acceptingPlane) Commit(_ context.Context, _ control.Lease, observed control.Record, ref string) (control.Record, error) {
+	if observed.HeadRef != p.record.HeadRef {
+		return control.Record{}, control.ErrFenced
 	}
-	return control.Record{}, errors.New("connection lost after commit")
+	p.record.CommittedSeq++
+	p.record.HeadRef = ref
+	p.record.Revision++
+	return p.record, nil
 }
-func (c *ambiguousCommitter) Get(ctx context.Context, _ string) (control.Record, error) {
-	if err := ctx.Err(); err != nil {
-		return control.Record{}, err
+func (p *acceptingPlane) Checkpoint(_ context.Context, _ control.Lease, observed control.Record, ref string) (control.Record, error) {
+	if observed.Revision != p.record.Revision {
+		return control.Record{}, control.ErrFenced
 	}
-	return c.record, nil
+	p.record.FallbackRef = p.record.CheckpointRef
+	p.record.FallbackSeq = p.record.CheckpointSeq
+	p.record.CheckpointRef = ref
+	p.record.CheckpointSeq = p.record.CommittedSeq
+	p.record.Revision++
+	return p.record, nil
 }
-
-type snapshotStore struct {
-	values map[string][]byte
-}
-
-func (s *snapshotStore) Put(_ context.Context, key string, value []byte) error {
-	s.values[key] = append([]byte(nil), value...)
+func (p *acceptingPlane) SetProgress(context.Context, string, string, control.Progress) error {
 	return nil
 }
-func (s *snapshotStore) Get(_ context.Context, key string) ([]byte, error) {
-	return s.values[key], nil
-}
 
-func TestActorReconcilesCommitWhoseResponseWasLost(t *testing.T) {
-	store := &snapshotStore{values: make(map[string][]byte)}
-	lease := control.Lease{GameID: "g1", WorkerID: "worker-a", Epoch: 2}
-	requestCtx, cancel := context.WithCancel(context.Background())
-	committer := &ambiguousCommitter{
-		record:       control.Record{GameID: "g1", OwnerID: "worker-a", Epoch: 2, SnapshotSeq: 0},
-		cancelCommit: cancel,
+func TestCheckpointKeepsLatestFallbackAndCollectsCoveredDeltas(t *testing.T) {
+	ctx := context.Background()
+	s := &memoryStore{data: map[string][]byte{}}
+	cp, _ := json.Marshal(state.Checkpoint{Seq: 0, State: game.NewState()})
+	initial := state.Ref("checkpoint", "g2", 0, cp)
+	s.data[initial] = cp
+	p := &acceptingPlane{record: control.Record{GameID: "g2", OwnerID: "a", Epoch: 1, HeadRef: initial, CheckpointRef: initial, Revision: 1}}
+	a := worker.NewActor(control.Lease{GameID: "g2", WorkerID: "a", Epoch: 1}, p.record, state.Materialized{Head: initial, State: game.NewState()}, s, p)
+	moves := []string{"e2e4", "e7e5", "g1f3", "b8c6", "f1c4", "g8f6", "d2d3", "f8c5", "c2c3", "d7d6", "b1d2", "c8g4", "h2h3", "g4h5", "a2a4", "a7a6"}
+	for _, move := range moves {
+		if _, _, err := a.Move(ctx, move); err != nil {
+			t.Fatalf("move %s: %v", move, err)
+		}
 	}
-	actor := worker.NewActor(lease, 0, game.NewState(), store, committer)
-	defer actor.Close()
-
-	_, _, _ = actor.Move(requestCtx, "e2e4")
-	if snapshot := actor.State(); snapshot.Turn != "black" || len(snapshot.Moves) != 1 {
-		t.Fatalf("actor did not reconcile committed state: %#v", snapshot)
+	if p.record.CheckpointSeq != 16 || p.record.FallbackSeq != 8 {
+		t.Fatalf("checkpoints: %#v", p.record)
 	}
-}
-
-func TestClosedActorRejectsMove(t *testing.T) {
-	actor := worker.NewActor(control.Lease{GameID: "g1", WorkerID: "worker-a", Epoch: 4}, 7, game.NewState(), &recordingStore{}, &rejectingCommitter{})
-	actor.Close()
-
-	_, _, err := actor.Move(context.Background(), "e2e4")
-	if !errors.Is(err, worker.ErrActorClosed) {
-		t.Fatalf("move error = %v, want ErrActorClosed", err)
+	if _, ok := s.data[initial]; ok {
+		t.Fatal("obsolete initial checkpoint retained")
+	}
+	var cpCount, deltaCount int
+	for ref := range s.data {
+		if strings.HasPrefix(ref, "checkpoint/") {
+			cpCount++
+		}
+		if strings.HasPrefix(ref, "delta/") {
+			deltaCount++
+		}
+	}
+	if cpCount != 2 || deltaCount != 8 {
+		t.Fatalf("objects: checkpoints=%d deltas=%d", cpCount, deltaCount)
+	}
+	materialized, _, err := state.Materialize(ctx, s, p.record.CommittedSeq, p.record.HeadRef, p.record.CheckpointRef, p.record.CheckpointSeq, nil)
+	if err != nil || len(materialized.State.Moves) != 16 {
+		t.Fatalf("latest checkpoint recovery: moves=%d error=%v", len(materialized.State.Moves), err)
+	}
+	delete(s.data, p.record.CheckpointRef)
+	materialized, _, err = state.MaterializeWithFallback(ctx, s, p.record.CommittedSeq, p.record.HeadRef, p.record.CheckpointRef, p.record.CheckpointSeq, p.record.FallbackRef, p.record.FallbackSeq, nil)
+	if err != nil || len(materialized.State.Moves) != 16 {
+		t.Fatalf("fallback recovery: moves=%d error=%v", len(materialized.State.Moves), err)
 	}
 }

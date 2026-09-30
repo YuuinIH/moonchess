@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/yuuinih/moonchess/internal/control"
@@ -15,161 +16,139 @@ import (
 
 var ErrActorClosed = errors.New("room actor is closed")
 
-type CommitControl interface {
-	Commit(context.Context, control.Lease, int64, string) (control.Record, error)
-	Get(context.Context, string) (control.Record, error)
-}
-
-type moveRequest struct {
-	ctx   context.Context
-	move  string
-	reply chan moveResult
-}
-
-type moveResult struct {
-	state  game.State
-	record control.Record
-	err    error
-}
-
-// Actor serializes every command for one room. It deliberately writes the
-// immutable payload before attempting the fenced control-plane commit.
+// Actor serializes commands and never publishes a state before the fenced CAS.
 type Actor struct {
-	lease   control.Lease
-	store   state.Store
-	control CommitControl
-	moves   chan moveRequest
-	states  chan chan game.State
-	stop    chan struct{}
+	lease           control.Lease
+	store           state.Store
+	plane           control.Plane
+	mu              sync.Mutex
+	closed          bool
+	stop            chan struct{}
+	record          control.Record
+	materialized    state.Materialized
+	checkpointEvery int64
 }
 
-func NewActor(lease control.Lease, seq int64, initial game.State, store state.Store, commitControl CommitControl) *Actor {
-	a := &Actor{
-		lease: lease, store: store, control: commitControl,
-		moves: make(chan moveRequest), states: make(chan chan game.State), stop: make(chan struct{}),
+func NewActor(lease control.Lease, record control.Record, materialized state.Materialized, store state.Store, plane control.Plane) *Actor {
+	return &Actor{lease: lease, record: record, materialized: materialized, store: store, plane: plane, checkpointEvery: 8, stop: make(chan struct{})}
+}
+func (a *Actor) Lease() control.Lease { return a.lease }
+func (a *Actor) State() game.State    { a.mu.Lock(); defer a.mu.Unlock(); return a.materialized.State }
+func (a *Actor) Close() {
+	a.mu.Lock()
+	if !a.closed {
+		a.closed = true
+		close(a.stop)
 	}
-	go a.run(seq, initial)
-	return a
+	a.mu.Unlock()
 }
+func (a *Actor) Done() <-chan struct{} { return a.stop }
 
-func (a *Actor) run(seq int64, current game.State) {
-	for {
-		select {
-		case request := <-a.moves:
-			if _, _, err := a.syncFromControl(request.ctx, &seq, &current); err != nil {
-				request.reply <- moveResult{err: fmt.Errorf("synchronize actor: %w", err)}
-				continue
-			}
-			next, err := current.Apply(request.move)
-			if err != nil {
-				request.reply <- moveResult{err: err}
-				continue
-			}
-			payload, err := json.Marshal(next)
-			if err != nil {
-				request.reply <- moveResult{err: fmt.Errorf("encode snapshot: %w", err)}
-				continue
-			}
-			attemptID, err := newAttemptID()
-			if err != nil {
-				request.reply <- moveResult{err: err}
-				continue
-			}
-			key := fmt.Sprintf("game/%s/epoch/%d/seq/%d/attempt/%s", a.lease.GameID, a.lease.Epoch, seq+1, attemptID)
-			if err := a.store.Put(request.ctx, key, payload); err != nil {
-				request.reply <- moveResult{err: fmt.Errorf("put snapshot: %w", err)}
-				continue
-			}
-			record, err := a.control.Commit(request.ctx, a.lease, seq, key)
-			if err != nil {
-				reconcileCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-				reconciled, advanced, reconcileErr := a.syncFromControl(reconcileCtx, &seq, &current)
-				cancel()
-				if reconcileErr == nil && advanced {
-					if reconciled.SnapshotKey == key {
-						request.reply <- moveResult{state: current, record: reconciled}
-						continue
-					}
-					request.reply <- moveResult{err: fmt.Errorf("actor reconciled to committed seq %d; retry move: %w", seq, err)}
-					continue
-				}
-				request.reply <- moveResult{err: fmt.Errorf("commit move: %w", err)}
-				continue
-			}
-			seq = record.SnapshotSeq
-			current = next
-			request.reply <- moveResult{state: current, record: record}
-		case reply := <-a.states:
-			reply <- current
-		case <-a.stop:
+func (a *Actor) Move(ctx context.Context, move string) (game.State, control.Record, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.closed {
+		return game.State{}, control.Record{}, ErrActorClosed
+	}
+	observed, err := a.plane.Get(ctx, a.lease.GameID)
+	if err != nil {
+		return game.State{}, control.Record{}, err
+	}
+	if observed.OwnerID != a.lease.WorkerID || observed.Epoch != a.lease.Epoch {
+		return game.State{}, control.Record{}, control.ErrFenced
+	}
+	if observed.HeadRef != a.materialized.Head {
+		m, _, err := state.MaterializeWithFallback(ctx, a.store, observed.CommittedSeq, observed.HeadRef, observed.CheckpointRef, observed.CheckpointSeq, observed.FallbackRef, observed.FallbackSeq, &a.materialized)
+		if err != nil {
+			return game.State{}, control.Record{}, err
+		}
+		a.materialized = m
+	}
+	next, err := a.materialized.State.Apply(move)
+	if err != nil {
+		return game.State{}, control.Record{}, err
+	}
+	attemptID, err := id.RandomHex(12)
+	if err != nil {
+		return game.State{}, control.Record{}, err
+	}
+	delta := state.Delta{Seq: observed.CommittedSeq + 1, Prev: observed.HeadRef, Move: move, AttemptID: attemptID}
+	payload, err := json.Marshal(delta)
+	if err != nil {
+		return game.State{}, control.Record{}, err
+	}
+	ref := state.Ref("delta", a.lease.GameID, delta.Seq, payload)
+	if err := a.store.Put(ctx, ref, payload); err != nil {
+		return game.State{}, control.Record{}, fmt.Errorf("put delta: %w", err)
+	}
+	committed, err := a.plane.Commit(ctx, a.lease, observed, ref)
+	if err != nil {
+		// A lost transaction response is ambiguous. Read the canonical head before replying.
+		reconcileCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		current, readErr := a.plane.Get(reconcileCtx, a.lease.GameID)
+		if readErr == nil && current.HeadRef == ref && current.CommittedSeq == delta.Seq {
+			committed = current
+		} else {
+			return game.State{}, control.Record{}, fmt.Errorf("commit move: %w", err)
+		}
+	}
+	a.materialized = state.Materialized{Seq: committed.CommittedSeq, Head: committed.HeadRef, State: next}
+	a.record = committed
+	_ = a.plane.SetProgress(ctx, a.lease.GameID, a.lease.WorkerID, control.Progress{Seq: a.materialized.Seq, HeadRef: a.materialized.Head})
+	if a.checkpointEvery > 0 && committed.CommittedSeq%a.checkpointEvery == 0 {
+		a.writeCheckpoint(ctx)
+	}
+	return next, a.record, nil
+}
+func (a *Actor) writeCheckpoint(ctx context.Context) {
+	previousBytes, err := a.store.Get(ctx, a.record.CheckpointRef)
+	if err != nil {
+		return
+	}
+	var previous state.Checkpoint
+	if err := json.Unmarshal(previousBytes, &previous); err != nil {
+		return
+	}
+	anchor := previous.Head
+	if previous.Seq == 0 {
+		anchor = a.record.CheckpointRef
+	}
+	var covered []string
+	for ref, seq := a.materialized.Head, a.materialized.Seq; seq > previous.Seq; seq-- {
+		bytes, err := a.store.Get(ctx, ref)
+		if err != nil {
+			return
+		}
+		var d state.Delta
+		if err := json.Unmarshal(bytes, &d); err != nil || d.Seq != seq {
+			return
+		}
+		covered = append(covered, ref)
+		ref = d.Prev
+		if seq == previous.Seq+1 && ref != anchor {
 			return
 		}
 	}
-}
-
-func (a *Actor) syncFromControl(ctx context.Context, seq *int64, current *game.State) (control.Record, bool, error) {
-	record, err := a.control.Get(ctx, a.lease.GameID)
+	cp := state.Checkpoint{Seq: a.materialized.Seq, Head: a.materialized.Head, State: a.materialized.State, PreviousCheckpointRef: a.record.CheckpointRef, CoveredRefs: covered}
+	payload, err := json.Marshal(cp)
 	if err != nil {
-		return control.Record{}, false, err
+		return
 	}
-	if record.OwnerID != a.lease.WorkerID || record.Epoch != a.lease.Epoch {
-		return record, false, control.ErrFenced
+	ref := state.Ref("checkpoint", a.lease.GameID, cp.Seq, payload)
+	if err = a.store.Put(ctx, ref, payload); err != nil {
+		return
 	}
-	if record.SnapshotSeq <= *seq {
-		return record, false, nil
-	}
-	payload, err := a.store.Get(ctx, record.SnapshotKey)
-	if err != nil {
-		return record, false, fmt.Errorf("get committed snapshot: %w", err)
-	}
-	var restored game.State
-	if err := json.Unmarshal(payload, &restored); err != nil {
-		return record, false, fmt.Errorf("decode committed snapshot: %w", err)
-	}
-	*seq = record.SnapshotSeq
-	*current = restored
-	return record, true, nil
-}
-
-func newAttemptID() (string, error) {
-	value, err := id.RandomHex(12)
-	if err != nil {
-		return "", fmt.Errorf("generate snapshot attempt id: %w", err)
-	}
-	return value, nil
-}
-
-func (a *Actor) Move(ctx context.Context, uci string) (game.State, control.Record, error) {
-	reply := make(chan moveResult, 1)
-	select {
-	case a.moves <- moveRequest{ctx: ctx, move: uci, reply: reply}:
-	case <-a.stop:
-		return game.State{}, control.Record{}, ErrActorClosed
-	case <-ctx.Done():
-		return game.State{}, control.Record{}, ctx.Err()
-	}
-	select {
-	case result := <-reply:
-		return result.state, result.record, result.err
-	case <-a.stop:
-		return game.State{}, control.Record{}, ErrActorClosed
-	case <-ctx.Done():
-		return game.State{}, control.Record{}, ctx.Err()
-	}
-}
-
-func (a *Actor) State() game.State {
-	reply := make(chan game.State, 1)
-	a.states <- reply
-	return <-reply
-}
-
-func (a *Actor) Lease() control.Lease { return a.lease }
-
-func (a *Actor) Close() {
-	select {
-	case <-a.stop:
-	default:
-		close(a.stop)
+	if record, err := a.plane.Checkpoint(ctx, a.lease, a.record, ref); err == nil {
+		// The old latest checkpoint is now fallback. Its covered deltas are no
+		// longer required by either retained checkpoint; the prior fallback is
+		// also unreachable. Failed removals only leak space.
+		for _, old := range previous.CoveredRefs {
+			_ = a.store.Remove(ctx, old)
+		}
+		if previous.PreviousCheckpointRef != "" {
+			_ = a.store.Remove(ctx, previous.PreviousCheckpointRef)
+		}
+		a.record = record
 	}
 }

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -26,16 +27,12 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	plane, err := openControlPlane(ctx, requiredEnv("DATABASE_URL"))
+	plane, err := openControlPlane(ctx, requiredEnv("ETCD_ENDPOINTS"))
 	if err != nil {
 		logger.Error("control plane unavailable", "error", err)
 		os.Exit(1)
 	}
 	defer plane.Close()
-	if err := plane.Migrate(ctx); err != nil {
-		logger.Error("migration failed", "error", err)
-		os.Exit(1)
-	}
 	store := statepkg.NewMooncakeHTTPStore(requiredEnv("MOONCAKE_URL"), &http.Client{Timeout: 5 * time.Second})
 
 	if os.Args[1] == "gateway" {
@@ -61,13 +58,19 @@ func main() {
 	serve(ctx, envOr("HTTP_ADDR", ":8081"), runtime.Handler(), logger)
 }
 
-func openControlPlane(ctx context.Context, dsn string) (*control.Postgres, error) {
+func openControlPlane(ctx context.Context, endpoints string) (*control.Etcd, error) {
 	deadline := time.Now().Add(30 * time.Second)
 	var last error
 	for time.Now().Before(deadline) {
-		plane, err := control.OpenPostgres(ctx, dsn)
+		plane, err := control.OpenEtcd(strings.Split(endpoints, ","))
 		if err == nil {
-			return plane, nil
+			checkCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+			_, err = plane.List(checkCtx)
+			cancel()
+			if err == nil {
+				return plane, nil
+			}
+			_ = plane.Close()
 		}
 		last = err
 		select {

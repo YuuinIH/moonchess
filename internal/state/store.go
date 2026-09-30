@@ -15,11 +15,12 @@ import (
 
 var ErrNotFound = errors.New("snapshot not found")
 
-// Store is the data-plane seam. Kubernetes or another store can be added
-// without changing the game or worker packages.
+// Store is the Mooncake data-plane seam. A native client can replace the REST
+// adapter without changing the game or worker packages.
 type Store interface {
 	Put(context.Context, string, []byte) error
 	Get(context.Context, string) ([]byte, error)
+	Remove(context.Context, string) error
 }
 
 // MooncakeHTTPStore uses the official Store REST API shipped with Mooncake.
@@ -85,4 +86,20 @@ func (s *MooncakeHTTPStore) Get(ctx context.Context, key string) ([]byte, error)
 		return nil, fmt.Errorf("read Mooncake snapshot: %w", err)
 	}
 	return data, nil
+}
+
+func (s *MooncakeHTTPStore) Remove(ctx context.Context, key string) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, s.baseURL+"/api/remove/"+url.PathEscape(key), nil)
+	if err != nil {
+		return err
+	}
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode/100 != 2 && resp.StatusCode != http.StatusNotFound {
+		return fmt.Errorf("Mooncake remove returned %s", resp.Status)
+	}
+	return nil
 }
