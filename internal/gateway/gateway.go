@@ -2,8 +2,6 @@ package gateway
 
 import (
 	"bytes"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,6 +13,7 @@ import (
 	"github.com/yuuinih/moonchess/internal/control"
 	"github.com/yuuinih/moonchess/internal/game"
 	"github.com/yuuinih/moonchess/internal/httpjson"
+	"github.com/yuuinih/moonchess/internal/id"
 	"github.com/yuuinih/moonchess/internal/state"
 	webassets "github.com/yuuinih/moonchess/web"
 )
@@ -127,11 +126,11 @@ func (g *Gateway) move(w http.ResponseWriter, request *http.Request) {
 }
 
 func randomID() (string, error) {
-	var value [12]byte
-	if _, err := rand.Read(value[:]); err != nil {
+	value, err := id.RandomHex(12)
+	if err != nil {
 		return "", fmt.Errorf("generate game id: %w", err)
 	}
-	return hex.EncodeToString(value[:]), nil
+	return value, nil
 }
 
 func ParseWorkerEndpoints(value string) (map[string]string, error) {

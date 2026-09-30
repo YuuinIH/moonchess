@@ -21,13 +21,20 @@ func (s *recordingStore) Put(_ context.Context, key string, _ []byte) error {
 }
 func (s *recordingStore) Get(context.Context, string) ([]byte, error) { return nil, nil }
 
-type rejectingCommitter struct{ called bool }
+type rejectingCommitter struct {
+	called   bool
+	getCalls int
+}
 
 func (c *rejectingCommitter) Commit(context.Context, control.Lease, int64, string) (control.Record, error) {
 	c.called = true
 	return control.Record{}, control.ErrFenced
 }
 func (c *rejectingCommitter) Get(context.Context, string) (control.Record, error) {
+	c.getCalls++
+	if c.getCalls == 1 {
+		return control.Record{OwnerID: "worker-a", Epoch: 4, SnapshotSeq: 7}, nil
+	}
 	return control.Record{OwnerID: "worker-b", Epoch: 5}, nil
 }
 
@@ -54,14 +61,21 @@ func TestActorLeavesOrphanAndDoesNotAdvanceWhenFenced(t *testing.T) {
 }
 
 type ambiguousCommitter struct {
-	record control.Record
+	record       control.Record
+	cancelCommit context.CancelFunc
 }
 
 func (c *ambiguousCommitter) Commit(_ context.Context, lease control.Lease, previousSeq int64, key string) (control.Record, error) {
 	c.record = control.Record{GameID: lease.GameID, OwnerID: lease.WorkerID, Epoch: lease.Epoch, SnapshotSeq: previousSeq + 1, SnapshotKey: key}
+	if c.cancelCommit != nil {
+		c.cancelCommit()
+	}
 	return control.Record{}, errors.New("connection lost after commit")
 }
-func (c *ambiguousCommitter) Get(context.Context, string) (control.Record, error) {
+func (c *ambiguousCommitter) Get(ctx context.Context, _ string) (control.Record, error) {
+	if err := ctx.Err(); err != nil {
+		return control.Record{}, err
+	}
 	return c.record, nil
 }
 
@@ -79,22 +93,23 @@ func (s *snapshotStore) Get(_ context.Context, key string) ([]byte, error) {
 
 func TestActorReconcilesCommitWhoseResponseWasLost(t *testing.T) {
 	store := &snapshotStore{values: make(map[string][]byte)}
-	committer := &ambiguousCommitter{}
 	lease := control.Lease{GameID: "g1", WorkerID: "worker-a", Epoch: 2}
+	requestCtx, cancel := context.WithCancel(context.Background())
+	committer := &ambiguousCommitter{
+		record:       control.Record{GameID: "g1", OwnerID: "worker-a", Epoch: 2, SnapshotSeq: 0},
+		cancelCommit: cancel,
+	}
 	actor := worker.NewActor(lease, 0, game.NewState(), store, committer)
 	defer actor.Close()
 
-	snapshot, record, err := actor.Move(context.Background(), "e2e4")
-	if err != nil {
-		t.Fatalf("move: %v", err)
-	}
-	if snapshot.Turn != "black" || record.SnapshotSeq != 1 {
-		t.Fatalf("snapshot=%#v record=%#v", snapshot, record)
+	_, _, _ = actor.Move(requestCtx, "e2e4")
+	if snapshot := actor.State(); snapshot.Turn != "black" || len(snapshot.Moves) != 1 {
+		t.Fatalf("actor did not reconcile committed state: %#v", snapshot)
 	}
 }
 
 func TestClosedActorRejectsMove(t *testing.T) {
-	actor := worker.NewActor(control.Lease{GameID: "g1"}, 0, game.NewState(), &recordingStore{}, &rejectingCommitter{})
+	actor := worker.NewActor(control.Lease{GameID: "g1", WorkerID: "worker-a", Epoch: 4}, 7, game.NewState(), &recordingStore{}, &rejectingCommitter{})
 	actor.Close()
 
 	_, _, err := actor.Move(context.Background(), "e2e4")
