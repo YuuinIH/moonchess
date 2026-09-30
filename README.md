@@ -1,6 +1,6 @@
 # MoonChess
 
-MoonChess studies where a chess room's **state control plane** ends and Mooncake's **transfer/data plane** begins. Its second question is whether **partial materialization and state locality aware scheduling** reduce takeover work: a warm worker replays only a missing delta suffix, while a cold worker loads a checkpoint and replays the remaining chain. Chess state is ordinary FEN, legal move history, turn, and status; it is not artificially enlarged to make transfers look impressive.
+MoonChess studies where a chess room's **state control plane** ends and Mooncake's **transfer/data plane** begins. Its second question is whether **partial materialization and state locality aware scheduling** reduce takeover work: a warm worker replays only a missing delta suffix, while a cold worker loads a checkpoint and replays the remaining chain. Here locality means the chess state already materialized in a Go worker, not Mooncake replica placement. Chess state is ordinary FEN, legal move history, turn, and status; it is not artificially enlarged to make transfers look impressive.
 
 ## Architecture
 
@@ -14,7 +14,7 @@ Browser -> Go gateway -> Go room actor
 MaterializedState = Checkpoint + DeltaSuffix
 ```
 
-etcd is the sole coordination authority. Each game has a metadata record containing epoch, committed sequence, head ref, latest and fallback checkpoint refs/sequences, migration target, and phase. A separate owner key has an etcd lease. Worker progress (materialized sequence and head) is advisory; it cannot authorize commits. Mooncake holds only immutable payloads and handles their placement, replication, and transfer. A delta key includes its content SHA-256 and sequence; competing attempts at one sequence cannot overwrite one another. A move is acknowledged only after the owner, lease, epoch, metadata revision, and head have passed one etcd transaction. Failed transactions leave unreachable Mooncake objects.
+etcd is the sole coordination authority. Each game has a metadata record containing epoch, committed sequence, head ref, latest and fallback checkpoint refs/sequences, migration target, and phase. A separate owner key has an etcd lease. Worker progress (materialized sequence and head) is advisory; it cannot authorize commits. Mooncake holds only immutable payloads. This experiment deliberately uses one basic Store node; multi-Store replica placement and physical cross-node transfer are not research targets. A delta key includes its content SHA-256 and sequence; competing attempts at one sequence cannot overwrite one another. A move is acknowledged only after the owner, lease, epoch, metadata revision, and head have passed one etcd transaction. Failed transactions leave unreachable Mooncake objects.
 
 Both crash failover and explicit migration use `select target -> materialize to canonical head -> transfer ownership`. The target materializes before acquiring the owner key. Graceful migration pins the chosen target in etcd, releases the prior lease, then allows that target to acquire. A stale resumed worker can still produce an orphan object, but its etcd transaction is fenced.
 
@@ -35,6 +35,6 @@ API: `POST /api/games`, `GET /api/games/{id}`, `POST /api/games/{id}/moves` with
 
 ## Native Mooncake binding status
 
-Mooncake v0.3.13.post1 has an official Go binding over `store_c.h` and `libmooncake_store`; its `Setup`, `Put`, `Get`, and `Remove` surface was checked against the pinned source. The current Compose build still uses the release image's official Store REST service as the Go data-plane adapter. That service itself wraps the native library, but includes Python in the infrastructure image. The application, control plane, gateway, and workers are Go. See [binding survey](docs/mooncake-bindings.md). Native Go linking and direct per-worker Mooncake segment placement remain unverified; the measured bytes are application payload reads, not physical network traffic.
+Mooncake v0.3.13.post1 has an official Go binding over `store_c.h` and `libmooncake_store`; its `Setup`, `Put`, `Get`, and `Remove` surface was checked against the pinned source. The current Compose build uses the release image's official Store REST service as the Go data-plane adapter. That service wraps the native library and is sufficient for the single-Store experiment; Python is confined to the infrastructure image. The application, control plane, gateway, and workers are Go. See [binding survey](docs/mooncake-bindings.md). Reported bytes are application payload reads, not physical network traffic; native Go linking and multi-Store placement are optional future work, not completion criteria here.
 
 The standalone Mooncake Store process is an independent worker failure boundary, not durable storage. Loss of that process loses payloads. Kubernetes is not required.
