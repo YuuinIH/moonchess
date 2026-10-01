@@ -5,9 +5,10 @@ test:
 	go vet ./...
 
 integration:
-	MOONCHESS_TEST_ETCD_ENDPOINT=http://localhost:12379 go test ./internal/control -run TestEtcdFencesExpiredOwner -count=1
+	MOONCHESS_TEST_ETCD_ENDPOINT=http://localhost:12379 go test -race ./internal/control -count=1
 
 verify: test up integration
+	python3 ./scripts/demo-e2e.py
 	./scripts/smoke.sh
 	./scripts/experiment-kill.sh
 	./scripts/experiment-stale.sh

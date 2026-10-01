@@ -157,3 +157,55 @@ func TestCheckpointKeepsLatestFallbackAndCollectsCoveredDeltas(t *testing.T) {
 		t.Fatalf("fallback recovery: moves=%d error=%v", len(materialized.State.Moves), err)
 	}
 }
+
+func TestPlayerAndTurnAuthorization(t *testing.T) {
+	ctx := context.Background()
+	s := &memoryStore{data: map[string][]byte{}}
+	p := &acceptingPlane{record: control.Record{GameID: "players", OwnerID: "worker-a", Epoch: 1, HeadRef: "cp", WhiteClientID: "white-client", BlackClientID: "black-client"}}
+	a := worker.NewActor(control.Lease{GameID: "players", WorkerID: "worker-a", Epoch: 1}, p.record, state.Materialized{Head: "cp", State: game.NewState()}, s, p)
+	for _, client := range []string{"", "outsider", "black-client"} {
+		if _, _, err := a.Move(ctx, "e2e4", client); !errors.Is(err, control.ErrUnauthorized) {
+			t.Fatalf("client %q: %v", client, err)
+		}
+	}
+	if len(s.data) != 0 {
+		t.Fatal("unauthorized commands wrote payloads")
+	}
+	if _, _, err := a.Move(ctx, "e2e4", "white-client"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := a.Move(ctx, "e7e5", "white-client"); !errors.Is(err, control.ErrUnauthorized) {
+		t.Fatal(err)
+	}
+	if _, _, err := a.Move(ctx, "e7e5", "black-client"); err != nil {
+		t.Fatal(err)
+	}
+	if p.record.CommittedSeq != 2 {
+		t.Fatal(p.record)
+	}
+}
+
+func TestConcurrentWhiteCommandsCannotPlayBothTurns(t *testing.T) {
+	ctx := context.Background()
+	s := &memoryStore{data: map[string][]byte{}}
+	p := &acceptingPlane{record: control.Record{GameID: "race", OwnerID: "worker-a", Epoch: 1, HeadRef: "cp", WhiteClientID: "white", BlackClientID: "black"}}
+	a := worker.NewActor(control.Lease{GameID: "race", WorkerID: "worker-a", Epoch: 1}, p.record, state.Materialized{Head: "cp", State: game.NewState()}, s, p)
+	results := make(chan error, 2)
+	for _, move := range []string{"e2e4", "d2d4"} {
+		go func(move string) { _, _, err := a.Move(ctx, move, "white"); results <- err }(move)
+	}
+	won, denied := 0, 0
+	for i := 0; i < 2; i++ {
+		err := <-results
+		if err == nil {
+			won++
+		} else if errors.Is(err, control.ErrUnauthorized) {
+			denied++
+		} else {
+			t.Fatal(err)
+		}
+	}
+	if won != 1 || denied != 1 || p.record.CommittedSeq != 1 || len(s.data) != 1 {
+		t.Fatalf("won=%d denied=%d record=%+v payloads=%d", won, denied, p.record, len(s.data))
+	}
+}

@@ -204,15 +204,19 @@ func (r *Runtime) handleMove(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	var body struct {
-		Move string `json:"move"`
+		Move     string `json:"move"`
+		ClientID string `json:"client_id"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, req.Body, 4096)).Decode(&body); err != nil || body.Move == "" {
 		httpjson.Write(w, 400, map[string]string{"error": "move must be a UCI string such as e2e4"})
 		return
 	}
-	snapshot, record, err := a.Move(req.Context(), body.Move)
+	snapshot, record, err := a.Move(req.Context(), body.Move, body.ClientID)
 	if err != nil {
 		status := 422
+		if errors.Is(err, control.ErrUnauthorized) {
+			status = 403
+		}
 		if errors.Is(err, control.ErrFenced) {
 			status = 409
 		}

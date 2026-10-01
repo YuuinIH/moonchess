@@ -12,6 +12,8 @@ var (
 )
 
 type Record struct {
+	WhiteClientID     string `json:"white_client_id,omitempty"`
+	BlackClientID     string `json:"black_client_id,omitempty"`
 	GameID            string `json:"gameId"`
 	OwnerID           string `json:"ownerId"`
 	Epoch             int64  `json:"epoch"`
