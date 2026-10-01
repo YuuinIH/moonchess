@@ -75,19 +75,13 @@ func (g *Gateway) events(w http.ResponseWriter, r *http.Request) {
 		c = fresh
 		queued, err := g.Lobby.Queued(r.Context(), c)
 		if err == nil {
-			status := "home"
-			if queued {
-				status = "searching"
-			}
-			if c.GameID != "" {
-				status = "matched"
-			}
+			snapshot := matchmakingSnapshot(c, queued)
 			clientJSON, _ := json.Marshal(c)
-			if status != lastStatus || string(clientJSON) != lastClient {
-				if !send("matchmaking", cursor.ID(), map[string]any{"status": status, "client": c}) {
+			if snapshot.Status != lastStatus || string(clientJSON) != lastClient {
+				if !send("matchmaking", cursor.ID(), snapshot) {
 					return
 				}
-				lastStatus = status
+				lastStatus = snapshot.Status
 				lastClient = string(clientJSON)
 			}
 		}

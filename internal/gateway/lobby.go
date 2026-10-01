@@ -151,6 +151,15 @@ func (g *Gateway) matchStatus(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 503, err)
 		return
 	}
+	httpjson.Write(w, 200, matchmakingSnapshot(c, queued))
+}
+
+type matchState struct {
+	Status string         `json:"status"`
+	Client control.Client `json:"client"`
+}
+
+func matchmakingSnapshot(c control.Client, queued bool) matchState {
 	status := "home"
 	if queued {
 		status = "searching"
@@ -158,16 +167,20 @@ func (g *Gateway) matchStatus(w http.ResponseWriter, r *http.Request) {
 	if c.GameID != "" {
 		status = "matched"
 	}
-	httpjson.Write(w, 200, map[string]any{"status": status, "client": c})
+	return matchState{Status: status, Client: c}
 }
+
 func (g *Gateway) materialize(ctx context.Context, id string) (control.Record, state.Materialized, error) {
 	record, err := g.Plane.Get(ctx, id)
 	if err != nil {
 		return record, state.Materialized{}, err
 	}
+	return g.materializeRecord(ctx, record)
+}
+func (g *Gateway) materializeRecord(ctx context.Context, record control.Record) (control.Record, state.Materialized, error) {
 	m, _, err := state.MaterializeWithFallback(ctx, g.Store, record.CommittedSeq, record.HeadRef, record.CheckpointRef, record.CheckpointSeq, record.FallbackRef, record.FallbackSeq, nil)
 	if err != nil {
-		fresh, readErr := g.Plane.Get(ctx, id)
+		fresh, readErr := g.Plane.Get(ctx, record.GameID)
 		if readErr == nil && fresh.Revision != record.Revision {
 			record = fresh
 			m, _, err = state.MaterializeWithFallback(ctx, g.Store, record.CommittedSeq, record.HeadRef, record.CheckpointRef, record.CheckpointSeq, record.FallbackRef, record.FallbackSeq, nil)
