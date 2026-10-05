@@ -115,7 +115,12 @@ func (e *Etcd) Acquire(ctx context.Context, observed Record, worker string, ttl 
 	next.TargetUntilUnixMS = 0
 	next.Phase = "active"
 	next.Revision = 0
-	resp, err := e.client.Txn(ctx).If(clientv3.Compare(clientv3.CreateRevision(ownerKey(l.GameID)), "=", 0), clientv3.Compare(clientv3.ModRevision(metaKey(l.GameID)), "=", observed.Revision)).Then(clientv3.OpPut(ownerKey(l.GameID), ownerValue(l), clientv3.WithLease(grant.ID)), clientv3.OpPut(metaKey(l.GameID), encode(next))).Commit()
+	event, eventErr := ownershipOp("acquired", Record{GameID: l.GameID, OwnerID: worker, Epoch: l.Epoch, CommittedSeq: next.CommittedSeq, Phase: next.Phase})
+	if eventErr != nil {
+		_, _ = e.client.Revoke(ctx, grant.ID)
+		return Lease{}, eventErr
+	}
+	resp, err := e.client.Txn(ctx).If(clientv3.Compare(clientv3.CreateRevision(ownerKey(l.GameID)), "=", 0), clientv3.Compare(clientv3.ModRevision(metaKey(l.GameID)), "=", observed.Revision)).Then(clientv3.OpPut(ownerKey(l.GameID), ownerValue(l), clientv3.WithLease(grant.ID)), clientv3.OpPut(metaKey(l.GameID), encode(next)), event).Commit()
 	if err != nil || !resp.Succeeded {
 		_, _ = e.client.Revoke(context.Background(), grant.ID)
 		if err != nil {
@@ -139,7 +144,17 @@ func (e *Etcd) Renew(ctx context.Context, l Lease) error {
 func (e *Etcd) update(ctx context.Context, l Lease, observed Record, next Record) (Record, error) {
 	next.OwnerID = ""
 	next.Revision = 0
-	resp, err := e.client.Txn(ctx).If(clientv3.Compare(clientv3.Value(ownerKey(l.GameID)), "=", ownerValue(l)), clientv3.Compare(clientv3.LeaseValue(ownerKey(l.GameID)), "=", l.ID), clientv3.Compare(clientv3.ModRevision(metaKey(l.GameID)), "=", observed.Revision)).Then(clientv3.OpPut(metaKey(l.GameID), encode(next))).Commit()
+	ops := []clientv3.Op{clientv3.OpPut(metaKey(l.GameID), encode(next))}
+	if next.Phase != observed.Phase {
+		eventRecord := next
+		eventRecord.OwnerID = l.WorkerID
+		event, err := ownershipOp(next.Phase, eventRecord)
+		if err != nil {
+			return Record{}, err
+		}
+		ops = append(ops, event)
+	}
+	resp, err := e.client.Txn(ctx).If(clientv3.Compare(clientv3.Value(ownerKey(l.GameID)), "=", ownerValue(l)), clientv3.Compare(clientv3.LeaseValue(ownerKey(l.GameID)), "=", l.ID), clientv3.Compare(clientv3.ModRevision(metaKey(l.GameID)), "=", observed.Revision)).Then(ops...).Commit()
 	if err != nil {
 		return Record{}, err
 	}
@@ -205,7 +220,11 @@ func (e *Etcd) CancelMigration(ctx context.Context, l Lease, observed Record) (R
 	return e.update(ctx, l, observed, next)
 }
 func (e *Etcd) Release(ctx context.Context, l Lease) error {
-	resp, err := e.client.Txn(ctx).If(clientv3.Compare(clientv3.Value(ownerKey(l.GameID)), "=", ownerValue(l)), clientv3.Compare(clientv3.LeaseValue(ownerKey(l.GameID)), "=", l.ID)).Then(clientv3.OpDelete(ownerKey(l.GameID))).Commit()
+	event, eventErr := ownershipOp("released", Record{GameID: l.GameID, Epoch: l.Epoch, Phase: "between owners"})
+	if eventErr != nil {
+		return eventErr
+	}
+	resp, err := e.client.Txn(ctx).If(clientv3.Compare(clientv3.Value(ownerKey(l.GameID)), "=", ownerValue(l)), clientv3.Compare(clientv3.LeaseValue(ownerKey(l.GameID)), "=", l.ID)).Then(clientv3.OpDelete(ownerKey(l.GameID)), event).Commit()
 	if err != nil {
 		return err
 	}

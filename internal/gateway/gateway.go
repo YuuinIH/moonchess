@@ -20,6 +20,7 @@ import (
 )
 
 type Gateway struct {
+	Lobby           control.Lobby
 	Plane           control.Plane
 	Store           state.Store
 	WorkerEndpoints map[string]string
@@ -30,7 +31,11 @@ func (g *Gateway) Handler() http.Handler {
 	if g.Client == nil {
 		g.Client = &http.Client{Timeout: 5 * time.Second}
 	}
+	if g.Lobby == nil {
+		g.Lobby, _ = g.Plane.(control.Lobby)
+	}
 	mux := http.NewServeMux()
+	g.lobbyRoutes(mux)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		httpjson.Write(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
@@ -73,18 +78,19 @@ func (g *Gateway) getGame(w http.ResponseWriter, request *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	var materialized state.Materialized
-	for attempt := 0; attempt < 2; attempt++ {
-		materialized, _, err = state.MaterializeWithFallback(request.Context(), g.Store, record.CommittedSeq, record.HeadRef, record.CheckpointRef, record.CheckpointSeq, record.FallbackRef, record.FallbackSeq, nil)
-		if err == nil {
-			break
+	if record.WhiteClientID != "" {
+		c, authErr := g.session(request)
+		if authErr != nil {
+			writeError(w, 401, authErr)
+			return
 		}
-		fresh, readErr := g.Plane.Get(request.Context(), record.GameID)
-		if readErr != nil || fresh.Revision == record.Revision {
-			break
+		if c.ID != record.WhiteClientID && c.ID != record.BlackClientID {
+			writeError(w, 403, control.ErrUnauthorized)
+			return
 		}
-		record = fresh
 	}
+	var materialized state.Materialized
+	record, materialized, err = g.materializeRecord(request.Context(), record)
 	if err != nil {
 		writeError(w, http.StatusServiceUnavailable, err)
 		return
@@ -94,7 +100,8 @@ func (g *Gateway) getGame(w http.ResponseWriter, request *http.Request) {
 
 func (g *Gateway) move(w http.ResponseWriter, request *http.Request) {
 	var body struct {
-		Move string `json:"move"`
+		Move     string `json:"move"`
+		ClientID string `json:"client_id"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, request.Body, 4096)).Decode(&body); err != nil || body.Move == "" {
 		writeError(w, http.StatusBadRequest, errors.New("move must be a UCI string such as e2e4"))
@@ -108,6 +115,20 @@ func (g *Gateway) move(w http.ResponseWriter, request *http.Request) {
 			writeError(w, http.StatusInternalServerError, err)
 		}
 		return
+	}
+	if record.WhiteClientID != "" {
+		c, authErr := g.session(request)
+		if authErr != nil {
+			writeError(w, 401, authErr)
+			return
+		}
+		if c.ID != record.WhiteClientID && c.ID != record.BlackClientID {
+			writeError(w, 403, control.ErrUnauthorized)
+			return
+		}
+		body.ClientID = c.ID
+	} else {
+		body.ClientID = ""
 	}
 	endpoint := g.WorkerEndpoints[record.OwnerID]
 	if endpoint == "" {

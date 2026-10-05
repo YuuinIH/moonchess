@@ -41,7 +41,9 @@ func main() {
 			logger.Error("invalid worker endpoints", "error", err)
 			os.Exit(1)
 		}
-		app := (&gateway.Gateway{Plane: plane, Store: store, WorkerEndpoints: endpoints}).Handler()
+		g := &gateway.Gateway{Plane: plane, Lobby: plane, Store: store, WorkerEndpoints: endpoints}
+		app := g.Handler()
+		go func() { _ = g.RunMatchmaker(ctx) }()
 		serve(ctx, envOr("HTTP_ADDR", ":8080"), app, logger)
 		return
 	}

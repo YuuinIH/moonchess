@@ -45,7 +45,7 @@ func (a *Actor) Close() {
 }
 func (a *Actor) Done() <-chan struct{} { return a.stop }
 
-func (a *Actor) Move(ctx context.Context, move string) (game.State, control.Record, error) {
+func (a *Actor) Move(ctx context.Context, move string, clients ...string) (game.State, control.Record, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.closed {
@@ -64,6 +64,22 @@ func (a *Actor) Move(ctx context.Context, move string) (game.State, control.Reco
 			return game.State{}, control.Record{}, err
 		}
 		a.materialized = m
+	}
+	if observed.WhiteClientID != "" {
+		client := ""
+		if len(clients) > 0 {
+			client = clients[0]
+		}
+		expected := observed.WhiteClientID
+		if a.materialized.State.Turn == "black" {
+			expected = observed.BlackClientID
+		}
+		if client == "" || client != expected {
+			return game.State{}, control.Record{}, control.ErrUnauthorized
+		}
+	}
+	if a.materialized.State.Status != "active" {
+		return game.State{}, control.Record{}, errors.New("game is finished")
 	}
 	next, err := a.materialized.State.Apply(move)
 	if err != nil {

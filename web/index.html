@@ -11,8 +11,14 @@
     <section>
       <p class="eyebrow">MOONCHESS</p>
       <h1>State outlives the worker.</h1>
+      <p><strong id="view">Home</strong> · <span id="connection">Connecting…</span></p>
+      <label>Nickname <input id="nickname" maxlength="32"></label>
+      <button id="rename">Save nickname</button><button id="reset">Reset identity</button>
+      <p class="hint" id="client-id"></p>
+      <p><button id="find">Find Match</button><button id="cancel" hidden>Cancel search</button><button id="again" hidden>Play again</button><button id="replay" hidden>Replay</button></p>
+      <input id="replay-position" type="range" min="0" value="0" hidden aria-label="Replay move">
       <div id="board" class="board" aria-label="Chess board"></div>
-      <p id="message">Creating a room…</p>
+      <p id="message">Connecting…</p>
     </section>
     <aside>
       <h2>Control plane</h2>
@@ -21,8 +27,13 @@
         <dt>Owner</dt><dd id="owner">—</dd>
         <dt>Epoch</dt><dd id="epoch">—</dd>
         <dt>Snapshot</dt><dd id="sequence">—</dd>
+        <dt>Checkpoint</dt><dd id="checkpoint">—</dd>
         <dt>Phase</dt><dd id="lease">—</dd>
       </dl>
+      <button id="migrate">Migrate to another worker</button>
+      <h3>Local materialization</h3><pre id="materialization">—</pre>
+      <h3>Moves</h3><p id="moves"></p>
+      <h3>Event stream</h3><ol id="events"></ol>
       <p class="hint">Click a piece, then its destination. Moves use the full chess rules engine.</p>
     </aside>
   </main>
