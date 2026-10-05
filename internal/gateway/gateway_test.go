@@ -59,3 +59,48 @@ func TestMigrationChoosesCanonicalWarmWorker(t *testing.T) {
 		t.Fatalf("status=%d target=%q body=%s", rec.Code, chosen, rec.Body.String())
 	}
 }
+
+func TestFinishRoutesUseAuthenticatedSeatAndFixedReason(t *testing.T) {
+	for _, path := range []string{"resign", "abandon"} {
+		t.Run(path, func(t *testing.T) {
+			calls := 0
+			owner := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls++
+				var body struct {
+					ClientID string `json:"client_id"`
+					Reason   string `json:"reason"`
+				}
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					t.Error(err)
+				}
+				want := "resignation"
+				if path == "abandon" {
+					want = "abandonment"
+				}
+				if r.URL.Path != "/internal/games/game/finish" || body.ClientID != "white" || body.Reason != want {
+					t.Errorf("%s %+v", r.URL.Path, body)
+				}
+				w.Write([]byte(`{"game":{"status":"0-1"}}`))
+			}))
+			defer owner.Close()
+			for _, seat := range []string{"white", "outsider", ""} {
+				plane := eventPlane{record: control.Record{GameID: "game", OwnerID: "owner", WhiteClientID: seat, BlackClientID: "black"}}
+				g := &gateway.Gateway{Plane: plane, Lobby: eventLobby{}, WorkerEndpoints: map[string]string{"owner": owner.URL}}
+				req := httptest.NewRequest("POST", "/api/games/game/"+path, strings.NewReader(`{"client_id":"black","reason":"timeout"}`))
+				req.Header.Set("Cookie", "moonchess_session=valid")
+				response := httptest.NewRecorder()
+				g.Handler().ServeHTTP(response, req)
+				want := 403
+				if seat == "white" {
+					want = 200
+				}
+				if response.Code != want {
+					t.Fatalf("seat=%q response=%d %s", seat, response.Code, response.Body)
+				}
+			}
+			if calls != 1 {
+				t.Fatal("unauthorized finish was forwarded")
+			}
+		})
+	}
+}

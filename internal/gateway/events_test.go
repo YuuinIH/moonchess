@@ -117,3 +117,71 @@ func TestSSEReconnectFromCanonicalCheckpointOnNewGateway(t *testing.T) {
 		t.Fatalf("ownership=%v finished=%v recovered=%v scan=%v", ownership, finished, seqs, scanner.Err())
 	}
 }
+
+func TestSSEReconnectRecoversFinishAfterCheckpointAndDeltaGC(t *testing.T) {
+	for _, reason := range []string{"resignation", "abandonment", "timeout"} {
+		t.Run(reason, func(t *testing.T) {
+			snapshot := game.NewState()
+			for _, move := range []string{"e2e4", "e7e5", "g1f3", "b8c6", "f1c4", "g8f6", "d2d3"} {
+				var err error
+				snapshot, err = snapshot.Apply(move)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			snapshot, _ = snapshot.Finish("black", reason)
+			payload, _ := json.Marshal(state.Checkpoint{Seq: 8, Head: "final-head", State: snapshot})
+			ref := state.Ref("checkpoint", "game", 8, payload)
+			plane := eventPlane{record: control.Record{GameID: "game", OwnerID: "worker-b", Epoch: 3, CommittedSeq: 8, HeadRef: "final-head", CheckpointSeq: 8, CheckpointRef: ref, WhiteClientID: "white", BlackClientID: "black", Revision: 12}}
+			server := httptest.NewServer((&gateway.Gateway{Plane: plane, Lobby: eventLobby{}, Store: eventStore{payload: payload}}).Handler())
+			defer server.Close()
+			for _, cursor := range []string{"game:6:1:10", "game:8:3:12"} {
+				ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+				req, _ := http.NewRequestWithContext(ctx, "GET", server.URL+"/api/events", nil)
+				req.Header.Set("Cookie", "moonchess_session=valid")
+				req.Header.Set("Last-Event-ID", cursor)
+				resp, err := http.DefaultClient.Do(req)
+				if err != nil {
+					cancel()
+					t.Fatal(err)
+				}
+				scanner := bufio.NewScanner(resp.Body)
+				event := ""
+				var seqs []int64
+				finished := false
+				for scanner.Scan() {
+					line := scanner.Text()
+					if strings.HasPrefix(line, "event: ") {
+						event = strings.TrimPrefix(line, "event: ")
+					}
+					if !strings.HasPrefix(line, "data: ") {
+						continue
+					}
+					var body struct {
+						Seq     int64          `json:"seq"`
+						Game    game.State     `json:"game"`
+						Control control.Record `json:"control"`
+					}
+					if err = json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &body); err != nil {
+						t.Fatal(err)
+					}
+					if event == "move_committed" {
+						seqs = append(seqs, body.Seq)
+					}
+					if event == "game_finished" {
+						if body.Game.Reason != reason || body.Game.Status != "1-0" || body.Control.CommittedSeq != 8 {
+							t.Fatal(body)
+						}
+						finished = true
+						break
+					}
+				}
+				resp.Body.Close()
+				cancel()
+				if !finished || cursor == "game:6:1:10" && (len(seqs) != 1 || seqs[0] != 7) || cursor == "game:8:3:12" && len(seqs) != 0 {
+					t.Fatalf("cursor=%s finished=%v seqs=%v error=%v", cursor, finished, seqs, scanner.Err())
+				}
+			}
+		})
+	}
+}

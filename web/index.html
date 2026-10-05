@@ -17,6 +17,16 @@
       <p class="hint" id="client-id"></p>
       <p><button id="find">Find Match</button><button id="cancel" hidden>Cancel search</button><button id="again" hidden>Play again</button><button id="replay" hidden>Replay</button></p>
       <input id="replay-position" type="range" min="0" value="0" hidden aria-label="Replay move">
+      <div id="clocks" class="clocks" hidden aria-label="Chess clocks">
+        <span>White <strong id="white-clock">—</strong></span>
+        <span>Black <strong id="black-clock">—</strong></span>
+        <span class="hint" id="time-control"></span>
+      </div>
+      <p id="finish-actions" hidden><button id="resign">Resign</button> <button id="abandon">Abandon game</button></p>
+      <div id="finish-confirm" hidden>
+        <p id="finish-warning"></p>
+        <button id="confirm-finish">Confirm</button> <button id="cancel-finish">Keep playing</button>
+      </div>
       <div id="board" class="board" aria-label="Chess board"></div>
       <p id="message">Connecting…</p>
     </section>

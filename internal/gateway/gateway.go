@@ -24,6 +24,8 @@ type Gateway struct {
 	Plane           control.Plane
 	Store           state.Store
 	WorkerEndpoints map[string]string
+	InitialTime     time.Duration
+	Increment       time.Duration
 	Client          *http.Client
 }
 
@@ -42,6 +44,8 @@ func (g *Gateway) Handler() http.Handler {
 	mux.HandleFunc("POST /api/games", g.createGame)
 	mux.HandleFunc("GET /api/games/{gameID}", g.getGame)
 	mux.HandleFunc("POST /api/games/{gameID}/moves", g.move)
+	mux.HandleFunc("POST /api/games/{gameID}/resign", g.resign)
+	mux.HandleFunc("POST /api/games/{gameID}/abandon", g.abandon)
 	mux.HandleFunc("POST /api/games/{gameID}/migrate", g.migrate)
 	mux.Handle("/", http.FileServer(http.FS(webassets.Assets)))
 	return mux
@@ -65,7 +69,7 @@ func (g *Gateway) createGame(w http.ResponseWriter, request *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	httpjson.Write(w, http.StatusCreated, map[string]any{"game": snapshot, "control": record})
+	httpjson.Write(w, http.StatusCreated, map[string]any{"game": snapshot, "control": record, "serverTimeUnixMs": time.Now().UnixMilli()})
 }
 
 func (g *Gateway) getGame(w http.ResponseWriter, request *http.Request) {
@@ -95,7 +99,7 @@ func (g *Gateway) getGame(w http.ResponseWriter, request *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, err)
 		return
 	}
-	httpjson.Write(w, http.StatusOK, map[string]any{"game": materialized.State, "control": record})
+	httpjson.Write(w, http.StatusOK, map[string]any{"game": materialized.State, "control": record, "serverTimeUnixMs": time.Now().UnixMilli()})
 }
 
 func (g *Gateway) move(w http.ResponseWriter, request *http.Request) {
@@ -107,36 +111,63 @@ func (g *Gateway) move(w http.ResponseWriter, request *http.Request) {
 		writeError(w, http.StatusBadRequest, errors.New("move must be a UCI string such as e2e4"))
 		return
 	}
-	record, err := g.Plane.Get(request.Context(), request.PathValue("gameID"))
+	record, client, status, err := g.commandPlayer(request, false)
 	if err != nil {
-		if errors.Is(err, control.ErrNotFound) {
-			writeError(w, http.StatusNotFound, err)
-		} else {
-			writeError(w, http.StatusInternalServerError, err)
-		}
+		writeError(w, status, err)
 		return
 	}
-	if record.WhiteClientID != "" {
-		c, authErr := g.session(request)
-		if authErr != nil {
-			writeError(w, 401, authErr)
-			return
-		}
-		if c.ID != record.WhiteClientID && c.ID != record.BlackClientID {
-			writeError(w, 403, control.ErrUnauthorized)
-			return
-		}
-		body.ClientID = c.ID
-	} else {
-		body.ClientID = ""
+	body.ClientID = client
+	g.forwardCommand(w, request, record, "moves", body)
+}
+
+func (g *Gateway) resign(w http.ResponseWriter, request *http.Request) {
+	g.finish(w, request, "resignation")
+}
+func (g *Gateway) abandon(w http.ResponseWriter, request *http.Request) {
+	g.finish(w, request, "abandonment")
+}
+func (g *Gateway) finish(w http.ResponseWriter, request *http.Request, reason string) {
+	record, client, status, err := g.commandPlayer(request, true)
+	if err != nil {
+		writeError(w, status, err)
+		return
 	}
+	g.forwardCommand(w, request, record, "finish", map[string]string{"reason": reason, "client_id": client})
+}
+
+func (g *Gateway) commandPlayer(request *http.Request, seatedOnly bool) (control.Record, string, int, error) {
+	record, err := g.Plane.Get(request.Context(), request.PathValue("gameID"))
+	if err != nil {
+		status := http.StatusInternalServerError
+		if errors.Is(err, control.ErrNotFound) {
+			status = http.StatusNotFound
+		}
+		return record, "", status, err
+	}
+	if record.WhiteClientID == "" {
+		if seatedOnly {
+			return record, "", http.StatusForbidden, control.ErrUnauthorized
+		}
+		return record, "", 0, nil
+	}
+	c, err := g.session(request)
+	if err != nil {
+		return record, "", http.StatusUnauthorized, err
+	}
+	if c.ID != record.WhiteClientID && c.ID != record.BlackClientID {
+		return record, "", http.StatusForbidden, control.ErrUnauthorized
+	}
+	return record, c.ID, 0, nil
+}
+
+func (g *Gateway) forwardCommand(w http.ResponseWriter, request *http.Request, record control.Record, command string, body any) {
 	endpoint := g.WorkerEndpoints[record.OwnerID]
 	if endpoint == "" {
 		writeError(w, http.StatusServiceUnavailable, errors.New("room is between owners; retry shortly"))
 		return
 	}
 	payload, _ := json.Marshal(body)
-	url := strings.TrimRight(endpoint, "/") + "/internal/games/" + record.GameID + "/moves"
+	url := strings.TrimRight(endpoint, "/") + "/internal/games/" + record.GameID + "/" + command
 	req, err := http.NewRequestWithContext(request.Context(), http.MethodPost, url, bytes.NewReader(payload))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)

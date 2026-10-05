@@ -13,12 +13,16 @@ import (
 )
 
 type Delta struct {
-	Seq          int64  `json:"seq"`
-	Prev         string `json:"prev"`
-	Move         string `json:"move"`
-	AttemptID    string `json:"attemptId"`
-	WhiteClockMS int64  `json:"whiteClockMs,omitempty"`
-	BlackClockMS int64  `json:"blackClockMs,omitempty"`
+	Seq          int64       `json:"seq"`
+	Prev         string      `json:"prev"`
+	Move         string      `json:"move"`
+	AttemptID    string      `json:"attemptId"`
+	Kind         string      `json:"kind,omitempty"`
+	Reason       string      `json:"reason,omitempty"`
+	Loser        string      `json:"loser,omitempty"`
+	Clock        *game.Clock `json:"clock,omitempty"`
+	WhiteClockMS int64       `json:"whiteClockMs,omitempty"`
+	BlackClockMS int64       `json:"blackClockMs,omitempty"`
 }
 
 type Checkpoint struct {
@@ -116,9 +120,22 @@ func Materialize(ctx context.Context, store Store, seq int64, head string, check
 		ref = delta.Prev
 	}
 	for i := len(suffix) - 1; i >= 0; i-- {
-		next, err := base.State.Apply(suffix[i].Move)
+		d := suffix[i]
+		var next game.State
+		var err error
+		switch d.Kind {
+		case "", "move":
+			next, err = base.State.Apply(d.Move)
+		case "finish":
+			next, err = base.State.Finish(d.Loser, d.Reason)
+		default:
+			err = errors.New("unknown delta kind")
+		}
 		if err != nil {
 			return Materialized{}, metrics, fmt.Errorf("replay delta %d: %w", suffix[i].Seq, err)
+		}
+		if d.Clock != nil {
+			next.Clock = d.Clock
 		}
 		base.State = next
 		base.Seq = suffix[i].Seq

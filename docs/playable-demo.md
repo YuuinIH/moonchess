@@ -28,3 +28,17 @@ Implementation scope requested for this change, based on current main:
 The original unseated game API remains the local system-experiment sandbox.
 Reset is gated while playing to avoid stranding an active opponent. Replay
 uses the canonical legal move history already present in state checkpoints.
+
+## Game endings and time controls
+
+New matches use a 5+3 chess clock stored in immutable canonical state. The
+current turn consumes time across browser disconnects and worker replacement;
+only a committed legal move adds increment and switches the running side.
+A seated player may resign or explicitly abandon on either turn. The UI must
+confirm either action and allow cancellation. Closing a tab leaves time running
+and allows reconnection. The owner commits timeout even without a live browser.
+All endings use the existing fenced commit, preserve the legal move history,
+stop clocks, and remain visible through current-game queries and SSE reconnect.
+Reset and play-again are available after an ending. Legacy untimed rooms remain
+compatible. Verify seat authorization, stale fencing, concurrent commands,
+checkpoint/fallback recovery, and real migration/kill-owner behavior.

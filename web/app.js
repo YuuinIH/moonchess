@@ -17,7 +17,9 @@ let me,
   control,
   selected = null,
   stream,
-  replay = false;
+  replay = false,
+  pendingFinish = null,
+  serverOffset = 0;
 const $ = (s) => document.querySelector(s);
 async function api(path, method = "GET", body) {
   const r = await fetch(path, {
@@ -92,7 +94,7 @@ async function clickSquare(i, piece) {
       move,
     });
     updateGame(body);
-    $("#message").textContent = `Committed ${move}`;
+    if (current.status === "active") $("#message").textContent = `Committed ${move}`;
   } catch (e) {
     $("#message").textContent = e.message;
   }
@@ -105,6 +107,12 @@ function setView(name) {
   $("#replay").hidden = name !== "Finished";
   $("#board").hidden = name === "Home" || name === "Searching";
   $("#reset").disabled = name === "Game";
+  $("#finish-actions").hidden = name !== "Game";
+  $("#clocks").hidden = !current?.clock || (name !== "Game" && name !== "Finished");
+  if (name !== "Game") {
+    pendingFinish = null;
+    $("#finish-confirm").hidden = true;
+  }
   $("#migrate").disabled = name === "Home" || name === "Searching";
   $("#message").textContent =
     name === "Searching"
@@ -112,10 +120,18 @@ function setView(name) {
       : name === "Home"
         ? "Open another browser or private window and Find Match."
         : name === "Finished"
-          ? `Finished: ${current.status}`
+          ? `Finished: ${current.status}${current.reason ? " · " + current.reason : ""}`
           : `You are ${color()}. ${current.turn === color() ? "Your turn." : "Opponent’s turn."}`;
 }
 function updateGame(body) {
+  if (control?.gameId === body.control.gameId &&
+      (body.control.committedSeq < control.committedSeq ||
+       (body.control.committedSeq === control.committedSeq && body.control.epoch < control.epoch))) return;
+  if (body.serverTimeUnixMs) serverOffset = body.serverTimeUnixMs - Date.now();
+  if (control?.gameId !== body.control.gameId) {
+    pendingFinish = null;
+    $("#finish-confirm").hidden = true;
+  }
   current = body.game;
   control = body.control;
   selected = null;
@@ -124,6 +140,7 @@ function updateGame(body) {
   draw(current);
   renderControl(control);
   setView(current.status === "active" ? "Game" : "Finished");
+  renderClocks();
 }
 function renderControl(c) {
   $("#game-id").textContent = c.gameId;
@@ -134,6 +151,44 @@ function renderControl(c) {
   $("#checkpoint").textContent = `${c.checkpointSeq} · ${c.checkpointRef}`;
   $("#moves").textContent = (current.moves || []).join(" ");
 }
+function renderClocks() {
+  const c = current?.clock;
+  if (!c) return;
+  const elapsed = current.status === "active" && c.turnStartedUnixMs > 0
+    ? Math.max(0, Date.now() + serverOffset - c.turnStartedUnixMs) : 0;
+  for (const side of ["white", "black"]) {
+    const ms = Math.max(0, c[side + "Ms"] - (current.turn === side ? elapsed : 0));
+    const seconds = Math.ceil(ms / 1000);
+    const clock = $("#" + side + "-clock");
+    clock.textContent = `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}`;
+    clock.classList.toggle("running", current.status === "active" && current.turn === side);
+    clock.classList.toggle("low", ms < 30000);
+  }
+  $("#time-control").textContent = `+${c.incrementMs / 1000}s per move${current.status !== "active" ? " · stopped" : ""}`;
+}
+setInterval(renderClocks, 100);
+function confirmFinish(kind) {
+  pendingFinish = kind;
+  $("#finish-warning").textContent = kind === "resign"
+    ? "Resign this game? Your opponent wins."
+    : "Abandon this game? This ends the game and counts as a loss. Closing the page alone allows you to reconnect.";
+  $("#confirm-finish").textContent = kind === "resign" ? "Confirm resignation" : "Confirm abandonment";
+  $("#finish-confirm").hidden = false;
+}
+$("#resign").onclick = () => confirmFinish("resign");
+$("#abandon").onclick = () => confirmFinish("abandon");
+$("#cancel-finish").onclick = () => {
+  pendingFinish = null;
+  $("#finish-confirm").hidden = true;
+};
+$("#confirm-finish").onclick = () => action(async () => {
+  if (!pendingFinish || !control || current?.status !== "active") return;
+  const button = $("#confirm-finish");
+  button.disabled = true;
+  try {
+    updateGame(await api(`/api/games/${control.gameId}/${pendingFinish}`, "POST"));
+  } finally { button.disabled = false; }
+});
 function log(kind, data) {
   const li = document.createElement("li");
   li.textContent = `${new Date().toLocaleTimeString()} ${kind} ${JSON.stringify(data)}`;

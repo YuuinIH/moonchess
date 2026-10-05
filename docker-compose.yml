@@ -81,6 +81,8 @@ services:
       MOONCAKE_URL: http://mooncake-store:8080
       WORKER_ENDPOINTS: worker-a=http://worker-a:8081,worker-b=http://worker-b:8081
       HTTP_ADDR: :8080
+      GAME_TIME: ${GAME_TIME:-5m}
+      GAME_INCREMENT: ${GAME_INCREMENT:-3s}
     ports:
       - "18080:8080"
     depends_on:

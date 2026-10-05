@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/yuuinih/moonchess/internal/control"
+	"github.com/yuuinih/moonchess/internal/game"
 	"github.com/yuuinih/moonchess/internal/httpjson"
 	"github.com/yuuinih/moonchess/internal/state"
 )
@@ -59,6 +60,14 @@ func (r *Runtime) reconcile(ctx context.Context) error {
 		var materializeMetrics state.Metrics
 		actor := r.actor(record.GameID)
 		if record.OwnerID == r.ID && actor != nil && actor.Lease().Epoch == record.Epoch {
+			if actor.State().Expired(time.Now()) {
+				snapshot, committed, err := actor.Expire(ctx)
+				if err != nil {
+					r.Logger.Warn("timeout commit failed", "game", record.GameID, "error", err)
+				} else {
+					r.cacheState(committed, snapshot)
+				}
+			}
 			continue
 		}
 		if record.OwnerID != "" && record.OwnerID != r.ID || record.OwnerID == "" {
@@ -192,6 +201,7 @@ func (r *Runtime) Handler() http.Handler {
 		httpjson.Write(w, 200, map[string]string{"status": "ok", "worker": r.ID})
 	})
 	mux.HandleFunc("POST /internal/games/{gameID}/moves", r.handleMove)
+	mux.HandleFunc("POST /internal/games/{gameID}/finish", r.handleFinish)
 	mux.HandleFunc("POST /internal/games/{gameID}/migrate", r.handleMigrate)
 	mux.HandleFunc("POST /internal/games/{gameID}/prepare", r.handlePrepare)
 	mux.HandleFunc("GET /internal/games/{gameID}/progress", r.handleProgress)
@@ -223,10 +233,42 @@ func (r *Runtime) handleMove(w http.ResponseWriter, req *http.Request) {
 		httpjson.Write(w, status, map[string]string{"error": err.Error()})
 		return
 	}
+	r.cacheState(record, snapshot)
+	httpjson.Write(w, 200, map[string]any{"game": snapshot, "control": record, "serverTimeUnixMs": time.Now().UnixMilli()})
+}
+func (r *Runtime) cacheState(record control.Record, snapshot game.State) {
 	r.mu.Lock()
 	r.local[record.GameID] = state.Materialized{Seq: record.CommittedSeq, Head: record.HeadRef, State: snapshot}
 	r.mu.Unlock()
-	httpjson.Write(w, 200, map[string]any{"game": snapshot, "control": record})
+}
+func (r *Runtime) handleFinish(w http.ResponseWriter, req *http.Request) {
+	a := r.actor(req.PathValue("gameID"))
+	if a == nil {
+		httpjson.Write(w, 409, map[string]string{"error": "game is not loaded on this worker"})
+		return
+	}
+	var body struct {
+		Reason   string `json:"reason"`
+		ClientID string `json:"client_id"`
+	}
+	if json.NewDecoder(http.MaxBytesReader(w, req.Body, 4096)).Decode(&body) != nil {
+		httpjson.Write(w, 400, map[string]string{"error": "invalid finish command"})
+		return
+	}
+	snapshot, record, err := a.Finish(req.Context(), body.Reason, body.ClientID)
+	if err != nil {
+		status := 422
+		if errors.Is(err, control.ErrUnauthorized) {
+			status = 403
+		}
+		if errors.Is(err, control.ErrFenced) || errors.Is(err, ErrActorClosed) {
+			status = 409
+		}
+		httpjson.Write(w, status, map[string]string{"error": err.Error()})
+		return
+	}
+	r.cacheState(record, snapshot)
+	httpjson.Write(w, 200, map[string]any{"game": snapshot, "control": record, "serverTimeUnixMs": time.Now().UnixMilli()})
 }
 func (r *Runtime) handleMigrate(w http.ResponseWriter, req *http.Request) {
 	id := req.PathValue("gameID")

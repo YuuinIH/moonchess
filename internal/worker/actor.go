@@ -51,19 +51,9 @@ func (a *Actor) Move(ctx context.Context, move string, clients ...string) (game.
 	if a.closed {
 		return game.State{}, control.Record{}, ErrActorClosed
 	}
-	observed, err := a.plane.Get(ctx, a.lease.GameID)
+	observed, err := a.observe(ctx)
 	if err != nil {
 		return game.State{}, control.Record{}, err
-	}
-	if observed.OwnerID != a.lease.WorkerID || observed.Epoch != a.lease.Epoch {
-		return game.State{}, control.Record{}, control.ErrFenced
-	}
-	if observed.HeadRef != a.materialized.Head {
-		m, _, err := state.MaterializeWithFallback(ctx, a.store, observed.CommittedSeq, observed.HeadRef, observed.CheckpointRef, observed.CheckpointSeq, observed.FallbackRef, observed.FallbackSeq, &a.materialized)
-		if err != nil {
-			return game.State{}, control.Record{}, err
-		}
-		a.materialized = m
 	}
 	if observed.WhiteClientID != "" {
 		client := ""
@@ -81,15 +71,99 @@ func (a *Actor) Move(ctx context.Context, move string, clients ...string) (game.
 	if a.materialized.State.Status != "active" {
 		return game.State{}, control.Record{}, errors.New("game is finished")
 	}
-	next, err := a.materialized.State.Apply(move)
+	now := time.Now()
+	if a.materialized.State.Expired(now) {
+		return a.finish(ctx, observed, a.materialized.State.Turn, "timeout", now)
+	}
+	next, err := a.materialized.State.MoveAt(move, now)
 	if err != nil {
 		return game.State{}, control.Record{}, err
 	}
+	return a.commit(ctx, observed, next, state.Delta{Move: move})
+}
+
+// Finish accepts a seated player on either turn. A timeout that has already
+// elapsed takes precedence over a late resignation or abandonment request.
+func (a *Actor) Finish(ctx context.Context, reason, client string) (game.State, control.Record, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.closed {
+		return game.State{}, control.Record{}, ErrActorClosed
+	}
+	observed, err := a.observe(ctx)
+	if err != nil {
+		return game.State{}, control.Record{}, err
+	}
+	if observed.WhiteClientID == "" || client == "" || client != observed.WhiteClientID && client != observed.BlackClientID {
+		return game.State{}, control.Record{}, control.ErrUnauthorized
+	}
+	if reason != "resignation" && reason != "abandonment" {
+		return game.State{}, control.Record{}, errors.New("invalid termination reason")
+	}
+	if a.materialized.State.Status != "active" {
+		return a.materialized.State, observed, nil
+	}
+	now := time.Now()
+	loser := "white"
+	if client == observed.BlackClientID {
+		loser = "black"
+	}
+	if a.materialized.State.Expired(now) {
+		loser, reason = a.materialized.State.Turn, "timeout"
+	}
+	return a.finish(ctx, observed, loser, reason, now)
+}
+
+// Expire is called by the owner even when there are no connected browsers.
+func (a *Actor) Expire(ctx context.Context) (game.State, control.Record, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.closed {
+		return game.State{}, control.Record{}, ErrActorClosed
+	}
+	observed, err := a.observe(ctx)
+	if err != nil {
+		return game.State{}, control.Record{}, err
+	}
+	now := time.Now()
+	if !a.materialized.State.Expired(now) {
+		return a.materialized.State, observed, nil
+	}
+	return a.finish(ctx, observed, a.materialized.State.Turn, "timeout", now)
+}
+
+func (a *Actor) observe(ctx context.Context) (control.Record, error) {
+	observed, err := a.plane.Get(ctx, a.lease.GameID)
+	if err != nil {
+		return control.Record{}, err
+	}
+	if observed.OwnerID != a.lease.WorkerID || observed.Epoch != a.lease.Epoch {
+		return control.Record{}, control.ErrFenced
+	}
+	if observed.HeadRef != a.materialized.Head {
+		m, _, err := state.MaterializeWithFallback(ctx, a.store, observed.CommittedSeq, observed.HeadRef, observed.CheckpointRef, observed.CheckpointSeq, observed.FallbackRef, observed.FallbackSeq, &a.materialized)
+		if err != nil {
+			return control.Record{}, err
+		}
+		a.materialized = m
+	}
+	return observed, nil
+}
+
+func (a *Actor) finish(ctx context.Context, observed control.Record, loser, reason string, now time.Time) (game.State, control.Record, error) {
+	next, err := a.materialized.State.FinishAt(loser, reason, now)
+	if err != nil {
+		return game.State{}, control.Record{}, err
+	}
+	return a.commit(ctx, observed, next, state.Delta{Kind: "finish", Loser: loser, Reason: reason})
+}
+
+func (a *Actor) commit(ctx context.Context, observed control.Record, next game.State, delta state.Delta) (game.State, control.Record, error) {
 	attemptID, err := id.RandomHex(12)
 	if err != nil {
 		return game.State{}, control.Record{}, err
 	}
-	delta := state.Delta{Seq: observed.CommittedSeq + 1, Prev: observed.HeadRef, Move: move, AttemptID: attemptID}
+	delta.Seq, delta.Prev, delta.AttemptID, delta.Clock = observed.CommittedSeq+1, observed.HeadRef, attemptID, next.Clock
 	payload, err := json.Marshal(delta)
 	if err != nil {
 		return game.State{}, control.Record{}, err
@@ -107,7 +181,7 @@ func (a *Actor) Move(ctx context.Context, move string, clients ...string) (game.
 		if readErr == nil && current.HeadRef == ref && current.CommittedSeq == delta.Seq {
 			committed = current
 		} else {
-			return game.State{}, control.Record{}, fmt.Errorf("commit move: %w", err)
+			return game.State{}, control.Record{}, fmt.Errorf("commit command: %w", err)
 		}
 	}
 	a.materialized = state.Materialized{Seq: committed.CommittedSeq, Head: committed.HeadRef, State: next}

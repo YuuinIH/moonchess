@@ -209,3 +209,152 @@ func TestConcurrentWhiteCommandsCannotPlayBothTurns(t *testing.T) {
 		t.Fatalf("won=%d denied=%d record=%+v payloads=%d", won, denied, p.record, len(s.data))
 	}
 }
+
+func timedActor(t *testing.T, initial game.State) (*worker.Actor, *acceptingPlane, *memoryStore) {
+	t.Helper()
+	s := &memoryStore{data: map[string][]byte{}}
+	cp, _ := json.Marshal(state.Checkpoint{State: initial})
+	ref := state.Ref("checkpoint", "timed", 0, cp)
+	s.data[ref] = cp
+	p := &acceptingPlane{record: control.Record{GameID: "timed", OwnerID: "a", Epoch: 1, HeadRef: ref, CheckpointRef: ref, WhiteClientID: "white", BlackClientID: "black", Revision: 1}}
+	a := worker.NewActor(control.Lease{GameID: "timed", WorkerID: "a", Epoch: 1}, p.record, state.Materialized{Head: ref, State: initial}, s, p)
+	return a, p, s
+}
+
+func TestFinishEitherTurnAuthorizedAndRecoverable(t *testing.T) {
+	for _, reason := range []string{"resignation", "abandonment"} {
+		t.Run(reason, func(t *testing.T) {
+			ctx := context.Background()
+			a, p, s := timedActor(t, game.NewTimedState(time.Minute, 3*time.Second, time.Now()))
+			if _, _, err := a.Finish(ctx, reason, "outsider"); !errors.Is(err, control.ErrUnauthorized) {
+				t.Fatal(err)
+			}
+			if _, _, err := a.Finish(ctx, "timeout", "white"); err == nil {
+				t.Fatal("client can force timeout")
+			}
+			if len(s.data) != 1 {
+				t.Fatal("unauthorized command wrote payload")
+			}
+			finished, record, err := a.Finish(ctx, reason, "black") // black resigns during white's turn
+			if err != nil || finished.Status != "1-0" || finished.Reason != reason || record.CommittedSeq != 1 || len(finished.Moves) != 0 {
+				t.Fatalf("%+v %+v %v", finished, record, err)
+			}
+			if _, _, err = a.Finish(ctx, reason, "black"); err != nil {
+				t.Fatal(err)
+			}
+			if p.record.CommittedSeq != 1 {
+				t.Fatal("retry advanced seq")
+			}
+			m, _, err := state.Materialize(ctx, s, record.CommittedSeq, record.HeadRef, record.CheckpointRef, record.CheckpointSeq, nil)
+			if err != nil || m.State.Status != finished.Status || m.State.Reason != reason || m.State.Clock.TurnStartedUnixMS != 0 {
+				t.Fatalf("recovery %+v %v", m, err)
+			}
+			if _, _, err = a.Move(ctx, "e2e4", "white"); err == nil {
+				t.Fatal("finished room accepted a move")
+			}
+		})
+	}
+}
+
+func TestTimeoutSurvivesTakeoverAndPreventsLateMove(t *testing.T) {
+	ctx := context.Background()
+	for _, command := range []string{"expire", "move", "resign"} {
+		t.Run(command, func(t *testing.T) {
+			a, p, s := timedActor(t, game.NewTimedState(time.Second, 3*time.Second, time.Now().Add(-2*time.Second)))
+			// A restarted/takeover actor materializes the persisted anchor; no clock reset.
+			m, _, err := state.Materialize(ctx, s, 0, p.record.HeadRef, p.record.CheckpointRef, 0, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			p.record.OwnerID, p.record.Epoch = "b", 2
+			if _, _, err = a.Expire(ctx); !errors.Is(err, control.ErrFenced) {
+				t.Fatal(err)
+			}
+			if len(s.data) != 1 {
+				t.Fatal("stale actor wrote timeout")
+			}
+			a = worker.NewActor(control.Lease{GameID: "timed", WorkerID: "b", Epoch: 2}, p.record, m, s, p)
+			var finished game.State
+			var record control.Record
+			switch command {
+			case "expire":
+				finished, record, err = a.Expire(ctx)
+			case "move":
+				finished, record, err = a.Move(ctx, "e2e4", "white")
+			case "resign":
+				finished, record, err = a.Finish(ctx, "resignation", "black")
+			}
+			if err != nil || finished.Status != "0-1" || finished.Reason != "timeout" || record.CommittedSeq != 1 || len(finished.Moves) != 0 || finished.Clock.WhiteMS != 0 {
+				t.Fatalf("%+v %+v %v", finished, record, err)
+			}
+			if _, _, err = a.Expire(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if p.record.CommittedSeq != 1 {
+				t.Fatal("duplicate timeout")
+			}
+		})
+	}
+}
+
+func TestConcurrentMoveAndResignationProduceOneFinalResult(t *testing.T) {
+	ctx := context.Background()
+	a, p, s := timedActor(t, game.NewTimedState(time.Minute, 0, time.Now()))
+	results := make(chan error, 2)
+	go func() { _, _, err := a.Move(ctx, "e2e4", "white"); results <- err }()
+	go func() { _, _, err := a.Finish(ctx, "resignation", "white"); results <- err }()
+	<-results
+	<-results
+	m, _, err := state.Materialize(ctx, s, p.record.CommittedSeq, p.record.HeadRef, p.record.CheckpointRef, 0, nil)
+	if err != nil || m.State.Status != "0-1" || m.State.Reason != "resignation" || p.record.CommittedSeq != int64(len(m.State.Moves))+1 {
+		t.Fatalf("%+v %v", m, err)
+	}
+}
+
+func TestFinishOnCheckpointBoundaryRecoversFromFallback(t *testing.T) {
+	ctx := context.Background()
+	a, p, s := timedActor(t, game.NewTimedState(time.Minute, 0, time.Now()))
+	for i, move := range []string{"e2e4", "e7e5", "g1f3", "b8c6", "f1c4", "g8f6", "d2d3"} {
+		client := "white"
+		if i%2 == 1 {
+			client = "black"
+		}
+		if _, _, err := a.Move(ctx, move, client); err != nil {
+			t.Fatal(err)
+		}
+	}
+	finished, record, err := a.Finish(ctx, "abandonment", "black")
+	if err != nil || record.CheckpointSeq != 8 || record.FallbackSeq != 0 {
+		t.Fatalf("%+v %v", record, err)
+	}
+	for _, missingCheckpoint := range []bool{false, true} {
+		if missingCheckpoint {
+			s.Remove(ctx, p.record.CheckpointRef)
+		}
+		m, _, err := state.MaterializeWithFallback(ctx, s, record.CommittedSeq, record.HeadRef, record.CheckpointRef, record.CheckpointSeq, record.FallbackRef, record.FallbackSeq, nil)
+		if err != nil || m.State.Status != finished.Status || m.State.Reason != "abandonment" || len(m.State.Moves) != 7 || m.State.Clock.TurnStartedUnixMS != 0 {
+			t.Fatalf("missing=%v %+v %v", missingCheckpoint, m, err)
+		}
+	}
+}
+
+func TestFencedEndingCannotPublishResult(t *testing.T) {
+	for _, reason := range []string{"resignation", "timeout"} {
+		t.Run(reason, func(t *testing.T) {
+			s := &memoryStore{data: map[string][]byte{}}
+			r := control.Record{GameID: "ending-fenced", OwnerID: "a", Epoch: 1, HeadRef: "cp", WhiteClientID: "white", BlackClientID: "black"}
+			p := &rejectedPlane{record: r}
+			initial := game.NewTimedState(time.Second, 0, time.Now().Add(-2*time.Second))
+			a := worker.NewActor(control.Lease{GameID: r.GameID, WorkerID: "a", Epoch: 1}, r, state.Materialized{Head: "cp", State: initial}, s, p)
+			var err error
+			if reason == "timeout" {
+				_, _, err = a.Expire(context.Background())
+			} else {
+				_, _, err = a.Finish(context.Background(), reason, "white")
+			}
+			if !errors.Is(err, control.ErrFenced) || a.State().Status != "active" || p.commits != 1 || len(s.data) != 1 {
+				t.Fatalf("err=%v state=%+v commits=%d", err, a.State(), p.commits)
+			}
+		})
+	}
+}

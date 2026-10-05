@@ -116,3 +116,48 @@ For optional actual-browser verification, install Playwright in your test
 runtime and have Chrome installed (`BROWSER_CHANNEL` can select another supported
 channel), then run `node scripts/browser-e2e.cjs`; it uses two isolated browser
 contexts and exercises the Home / Searching / Game / Finished UI and replay.
+
+### Resign, abandon, and chess clocks
+
+New matches use **5+3**: each player starts with five minutes, and each legal
+move adds three seconds to that player's clock. Only the side to move spends
+time. Match creation starts White's clock; refreshing, disconnecting, migrating,
+or restarting a worker does not reset or pause it. The owner checks for timeout
+without requiring either browser to remain connected. If all workers are down,
+the result is committed after one resumes, using the original clock anchor.
+Workers must have synchronized wall clocks.
+
+During a game, **Resign** and **Abandon game** show a confirmation with a
+**Keep playing** option. Both end the game as a loss (with distinct reasons),
+even when it is the opponent's turn. Closing a tab alone allows reconnection;
+it does not send an abandonment command. Timeout normally loses the game; a
+bare-king opponent receives a draw. This demo does not implement the exhaustive
+FIDE test for whether every unusual position can reach checkmate.
+
+Finished games show the result/reason, stop both clocks, and retain Replay and
+Play again. `POST /api/games/{id}/resign` and `POST /api/games/{id}/abandon`
+require a seated anonymous session; caller-supplied identity/reason fields cannot
+change who forfeits. Duplicate finish requests return the existing result.
+Endings use immutable Mooncake deltas and the same fenced etcd commit as moves.
+The canonical sequence counts commands, so a non-move ending advances it once
+without adding a fictitious chess move. SSE reconnect recovers `game_finished`
+even after checkpointing or ownership changes.
+
+Gateway settings `GAME_TIME` (default `5m`) and `GAME_INCREMENT` (default `3s`)
+affect newly matched games only. Existing unseated debug games and old matches
+without clock data remain untimed. For a short manual timeout demo:
+
+```sh
+GAME_TIME=12s GAME_INCREMENT=0s docker compose up -d gateway
+# Match two browser clients and let the side to move run out of time.
+docker compose up -d gateway  # restore defaults for new matches
+```
+
+`python3 scripts/ending-e2e.py` verifies both voluntary endings, player
+permissions, finish retries, SSE recovery and clocks through migration/SIGKILL.
+It temporarily starts the gateway with a 12-second clock to test an offline
+player timing out after takeover, then restores the configured gateway and
+killed worker in cleanup. It is included in `make verify`.
+
+[Local browser recovery test, 2026-10-05](docs/recovery-smoke-2026-10-05.md)
+records the six ownership changes exercised in one game.

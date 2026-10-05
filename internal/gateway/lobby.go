@@ -203,7 +203,7 @@ func (g *Gateway) currentGame(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 503, err)
 		return
 	}
-	httpjson.Write(w, 200, map[string]any{"game": m.State, "control": record})
+	httpjson.Write(w, 200, map[string]any{"game": m.State, "control": record, "serverTimeUnixMs": time.Now().UnixMilli()})
 }
 func (g *Gateway) playAgain(w http.ResponseWriter, r *http.Request) {
 	c, err := g.session(r)
@@ -257,7 +257,7 @@ func (g *Gateway) matchOnce(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		payload, _ := json.Marshal(state.Checkpoint{Seq: 0, State: game.NewState()})
+		payload, _ := json.Marshal(state.Checkpoint{Seq: 0, State: g.newPlayerState(time.Now())})
 		ref := state.Ref("checkpoint", gameID, 0, payload)
 		if err = g.Store.Put(ctx, ref, payload); err != nil {
 			return err
@@ -268,4 +268,12 @@ func (g *Gateway) matchOnce(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+func (g *Gateway) newPlayerState(now time.Time) game.State {
+	initial, increment := g.InitialTime, g.Increment
+	if initial <= 0 {
+		initial, increment = 5*time.Minute, 3*time.Second
+	}
+	return game.NewTimedState(initial, increment, now)
 }

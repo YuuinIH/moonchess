@@ -41,7 +41,12 @@ func main() {
 			logger.Error("invalid worker endpoints", "error", err)
 			os.Exit(1)
 		}
-		g := &gateway.Gateway{Plane: plane, Lobby: plane, Store: store, WorkerEndpoints: endpoints}
+		initial, increment := durationEnv("GAME_TIME", 5*time.Minute), durationEnv("GAME_INCREMENT", 3*time.Second)
+		if initial < time.Millisecond || increment < 0 {
+			logger.Error("GAME_TIME must be at least 1ms and GAME_INCREMENT must be nonnegative")
+			os.Exit(2)
+		}
+		g := &gateway.Gateway{Plane: plane, Lobby: plane, Store: store, WorkerEndpoints: endpoints, InitialTime: initial, Increment: increment}
 		app := g.Handler()
 		go func() { _ = g.RunMatchmaker(ctx) }()
 		serve(ctx, envOr("HTTP_ADDR", ":8080"), app, logger)

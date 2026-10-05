@@ -105,19 +105,29 @@ func (g *Gateway) events(w http.ResponseWriter, r *http.Request) {
 				}
 				// The canonical checkpoint includes the entire legal move list, even after
 				// delta GC. Recover every missed committed move without a gateway-local log.
+				finishedSent := false
 				for seq := cursor.Seq + 1; seq <= record.CommittedSeq; seq++ {
-					if seq > int64(len(m.State.Moves)) {
-						return
-					}
 					id := eventCursor{c.GameID, seq, record.Epoch, cursor.Revision}.ID()
-					if !send("move_committed", id, map[string]any{"game_id": c.GameID, "seq": seq, "move": m.State.Moves[seq-1]}) {
-						return
+					if seq <= int64(len(m.State.Moves)) {
+						if !send("move_committed", id, map[string]any{"game_id": c.GameID, "seq": seq, "move": m.State.Moves[seq-1]}) {
+							return
+						}
+					} else {
+						// A finish command advances the canonical sequence but is not a
+						// chess move. It remains recoverable from the final checkpoint.
+						if seq != record.CommittedSeq || seq != int64(len(m.State.Moves))+1 || m.State.Status == "active" {
+							return
+						}
+						if !send("game_finished", id, map[string]any{"game": m.State, "control": record, "serverTimeUnixMs": time.Now().UnixMilli()}) {
+							return
+						}
+						finishedSent = true
 					}
 					cursor.Seq = seq
 				}
 				id := eventCursor{c.GameID, record.CommittedSeq, record.Epoch, cursor.Revision}.ID()
 				if first || previous.Revision != record.Revision || previous.OwnerID != record.OwnerID || previous.GameID != record.GameID {
-					if !send("game_state", id, map[string]any{"game": m.State, "control": record, "debug": g.debug(r, record)}) {
+					if !send("game_state", id, map[string]any{"game": m.State, "control": record, "serverTimeUnixMs": time.Now().UnixMilli(), "debug": g.debug(r, record)}) {
 						return
 					}
 					if first || previous.OwnerID != record.OwnerID || previous.Epoch != record.Epoch || previous.Phase != record.Phase {
@@ -125,8 +135,8 @@ func (g *Gateway) events(w http.ResponseWriter, r *http.Request) {
 							return
 						}
 					}
-					if m.State.Status != "active" {
-						if !send("game_finished", id, map[string]any{"game": m.State, "control": record}) {
+					if m.State.Status != "active" && !finishedSent {
+						if !send("game_finished", id, map[string]any{"game": m.State, "control": record, "serverTimeUnixMs": time.Now().UnixMilli()}) {
 							return
 						}
 					}

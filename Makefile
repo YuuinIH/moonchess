@@ -9,6 +9,7 @@ integration:
 
 verify: test up integration
 	python3 ./scripts/demo-e2e.py
+	python3 ./scripts/ending-e2e.py
 	./scripts/smoke.sh
 	./scripts/experiment-kill.sh
 	./scripts/experiment-stale.sh

@@ -17,7 +17,7 @@ body {
 main {
   width: min(1020px, 94vw);
   display: grid;
-  grid-template-columns: minmax(320px, 640px) 1fr;
+  grid-template-columns: minmax(0, 640px) minmax(260px, 1fr);
   gap: 48px;
   align-items: center;
 }
@@ -36,12 +36,16 @@ h1 {
 .board {
   display: grid;
   grid-template-columns: repeat(8, 1fr);
-  width: min(640px, 90vw);
+  grid-template-rows: repeat(8, 1fr);
+  width: min(640px, 100%);
   aspect-ratio: 1;
   border: 1px solid #58726a;
   box-shadow: 0 24px 80px #0009;
 }
 .square {
+  padding: 0;
+  min-width: 0;
+  min-height: 0;
   border: 0;
   font-size: clamp(24px, 6vw, 54px);
   display: grid;
@@ -78,7 +82,7 @@ dd {
   color: #9caaa6;
   line-height: 1.6;
 }
-@media (max-width: 780px) {
+@media (max-width: 900px) {
   main {
     grid-template-columns: 1fr;
     gap: 24px;
@@ -90,6 +94,12 @@ dd {
     padding: 20px 0 0;
   }
 }
+
+section, aside { min-width: 0; }
+.clocks { display: flex; gap: 18px; flex-wrap: wrap; margin: 16px 0; }
+.clocks strong { font-variant-numeric: tabular-nums; }
+.clocks .running { color: #8df0ce; }
+.clocks .low { color: #ffdb70; }
 
 [hidden] {
   display: none !important;
